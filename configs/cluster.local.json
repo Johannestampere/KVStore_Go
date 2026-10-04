@@ -1,0 +1,10 @@
+{
+  "virtual_nodes": 64,
+  "members": [
+    {"id": "node-a", "address": "http://127.0.0.1:8001"},
+    {"id": "node-b", "address": "http://127.0.0.1:8002"},
+    {"id": "node-c", "address": "http://127.0.0.1:8003"},
+    {"id": "node-d", "address": "http://127.0.0.1:8004"},
+    {"id": "node-e", "address": "http://127.0.0.1:8005"}
+  ]
+}

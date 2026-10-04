@@ -28,8 +28,9 @@ The HTTP handler depends on a small storage interface. The node executable
 connects it to `MemoryStore` and manages the server's lifecycle.
 
 An immutable consistent-hash ring selects key owners, and a static membership
-directory maps node IDs to HTTP addresses. These components are not yet connected
-to HTTP routing; the running server still stores every key locally.
+directory maps node IDs to HTTP addresses. Startup can load both from a shared
+JSON file. Request forwarding is not implemented yet: each process still stores
+and serves only its own local data.
 
 ## Quick start
 
@@ -93,9 +94,48 @@ for example, the key `user/42` uses `/kv/user%2F42`. Handler errors use
 `{"error":"message"}`. Unknown routes and unsupported methods use the standard
 router's responses. GET routes also support HEAD through Go's HTTP server.
 
+## Cluster startup configuration
+
+`configs/cluster.local.json` lists five local nodes on ports 8001–8005 with 64
+virtual positions per node. Run a node with its configured identity:
+
+```bash
+go run ./cmd/node -config configs/cluster.local.json -id node-a -addr 127.0.0.1:8001
+```
+
+In another terminal, a second process can use the same file:
+
+```bash
+go run ./cmd/node -config configs/cluster.local.json -id node-b -addr 127.0.0.1:8002
+```
+
+**These processes do not yet forward or replicate requests.** Configuration loads
+membership and validates the hash ring; all HTTP operations remain local.
+
+| Flag | Purpose | Default |
+| --- | --- | --- |
+| `-addr` | Local listening address | `127.0.0.1:8001` |
+| `-config` | Shared cluster JSON file | No cluster configuration |
+| `-id` | Local member ID from that file | None |
+
+`-config` and `-id` must be supplied together. The local ID must exist in the
+member list. `-addr` remains independent of the advertised member address and
+does not change automatically when selecting a different ID. This separation
+allows a process to bind a local interface while advertising a peer-reachable
+address. The server currently listens using plain HTTP.
+
+The configuration requires a `members` array and a positive `virtual_nodes`
+integer. Each member has `id` and `address` fields. Unknown fields, malformed JSON,
+extra JSON values, invalid membership, and invalid ring settings fail startup
+before binding the listening address. The file is read once; changes require
+restarting the process. Every node must use the same topology settings.
+
+Omit both cluster flags to retain the original single-node startup behavior.
+
 ## Tests
 
-Unit tests exercise storage, HTTP behavior, consistent hashing, and membership.
+Unit tests exercise storage, HTTP behavior, consistent hashing, membership, and
+configuration loading.
 Integration tests connect the real handler and store through a local HTTP server,
 covering key lifecycles, rejected writes, and concurrent clients.
 
@@ -117,10 +157,13 @@ Apple's Command Line Tools on macOS.
 cmd/node/main.go                 Server startup and shutdown
 internal/api/handler.go          HTTP routing and validation
 internal/cluster/membership.go   Static node IDs and HTTP addresses
+internal/config/config.go        Shared JSON configuration and local identity
 internal/consistenthash/ring.go   Deterministic key ownership
 internal/storage/memory.go       Concurrent in-memory storage
+configs/cluster.local.json       Five-node local topology
 tests/unit/api/                  Handler tests with a storage spy
 tests/unit/cluster/              Membership validation and lookup tests
+tests/unit/config/               Configuration loading tests
 tests/unit/consistenthash/       Hash-ring behavior and concurrency tests
 tests/unit/storage/              Storage tests
 tests/integration/api/           HTTP tests with real storage
@@ -186,5 +229,5 @@ directory; concurrent reads need no locks.
 
 Validation checks configuration syntax without DNS lookups or network requests.
 It does not verify reachability or whether different addresses refer to the same
-server. Offline nodes remain members. Startup configuration loading, local node
-identification, and request forwarding are subsequent milestones.
+server. Offline nodes remain members. Startup loads the directory and identifies
+the local node; request forwarding is the next milestone.
