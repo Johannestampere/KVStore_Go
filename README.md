@@ -27,6 +27,10 @@ Most toy KV stores stop at a map + mutex. This one is written to be a solid foun
 The HTTP handler depends on a small storage interface. The node executable
 connects it to `MemoryStore` and manages the server's lifecycle.
 
+An immutable consistent-hash ring provides key ownership selection for the next
+cluster milestone. It is not yet connected to HTTP routing; the running server
+still stores every key locally.
+
 ## Quick start
 
 Requires Go 1.27.0 or newer, matching `go.mod`.
@@ -91,9 +95,9 @@ router's responses. GET routes also support HEAD through Go's HTTP server.
 
 ## Tests
 
-Unit tests exercise storage and HTTP behavior independently. Integration tests
-connect the real handler and store through a local HTTP server, covering key
-lifecycles, rejected writes, and concurrent clients.
+Unit tests exercise storage, HTTP behavior, and consistent hashing independently.
+Integration tests connect the real handler and store through a local HTTP server,
+covering key lifecycles, rejected writes, and concurrent clients.
 
 ```bash
 go vet ./...
@@ -112,8 +116,10 @@ Apple's Command Line Tools on macOS.
 ```text
 cmd/node/main.go                 Server startup and shutdown
 internal/api/handler.go          HTTP routing and validation
+internal/consistenthash/ring.go   Deterministic key ownership
 internal/storage/memory.go       Concurrent in-memory storage
 tests/unit/api/                  Handler tests with a storage spy
+tests/unit/consistenthash/       Hash-ring behavior and concurrency tests
 tests/unit/storage/              Storage tests
 tests/integration/api/           HTTP tests with real storage
 ```
@@ -127,3 +133,32 @@ tests/integration/api/           HTTP tests with real storage
 | `Delete(key)` | Remove the key; missing key is a no-op |
 
 Empty keys and values are allowed. The `found` boolean is the only reliable way to distinguish a stored empty string from a missing key. Operations are individually synchronized; there are no multi-key transactions.
+
+## Consistent hashing
+
+`consistenthash.NewRing(nodeIDs, virtualNodes)` constructs a ring from unique,
+non-empty node IDs. Each physical node receives the same positive number of
+virtual positions. More positions provide additional opportunities to spread
+ownership across nodes; they do not guarantee equal load.
+
+`ring.GetNodes(key, count)` returns distinct physical node IDs in clockwise order.
+The first ID is the primary owner; subsequent IDs are candidate replicas.
+The count must be between one and the number of physical nodes. Empty keys are
+valid at this layer. Duplicate IDs, invalid virtual-node counts, and impossible
+replica counts return errors.
+
+Placement uses the first eight bytes of SHA-256, interpreted as a big-endian
+unsigned integer. Keys are hashed directly. Virtual positions hash the node ID,
+a NUL byte, and the zero-based decimal virtual-node index. Positions are sorted
+numerically, with node IDs breaking hash ties. All nodes must use the same IDs,
+virtual-node count, and hashing rules to agree on ownership.
+
+Lookups use binary search, wrap around the ring, and skip previously selected
+owners. The ring is immutable after construction and returns fresh result slices,
+so concurrent lookups need no locks. Construct a new ring to represent a different
+membership; this does not migrate stored values or provide live membership changes.
+
+The tests cover fixed routing examples, exact hash boundaries, wraparound,
+input-order independence, unique owners, caller mutation, and concurrent reads.
+Membership tests verify that adding a node only moves primary ownership to that
+node, and removing a node preserves primary ownership on remaining nodes.
