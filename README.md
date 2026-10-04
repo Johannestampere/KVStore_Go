@@ -27,9 +27,9 @@ Most toy KV stores stop at a map + mutex. This one is written to be a solid foun
 The HTTP handler depends on a small storage interface. The node executable
 connects it to `MemoryStore` and manages the server's lifecycle.
 
-An immutable consistent-hash ring provides key ownership selection for the next
-cluster milestone. It is not yet connected to HTTP routing; the running server
-still stores every key locally.
+An immutable consistent-hash ring selects key owners, and a static membership
+directory maps node IDs to HTTP addresses. These components are not yet connected
+to HTTP routing; the running server still stores every key locally.
 
 ## Quick start
 
@@ -95,7 +95,7 @@ router's responses. GET routes also support HEAD through Go's HTTP server.
 
 ## Tests
 
-Unit tests exercise storage, HTTP behavior, and consistent hashing independently.
+Unit tests exercise storage, HTTP behavior, consistent hashing, and membership.
 Integration tests connect the real handler and store through a local HTTP server,
 covering key lifecycles, rejected writes, and concurrent clients.
 
@@ -116,9 +116,11 @@ Apple's Command Line Tools on macOS.
 ```text
 cmd/node/main.go                 Server startup and shutdown
 internal/api/handler.go          HTTP routing and validation
+internal/cluster/membership.go   Static node IDs and HTTP addresses
 internal/consistenthash/ring.go   Deterministic key ownership
 internal/storage/memory.go       Concurrent in-memory storage
 tests/unit/api/                  Handler tests with a storage spy
+tests/unit/cluster/              Membership validation and lookup tests
 tests/unit/consistenthash/       Hash-ring behavior and concurrency tests
 tests/unit/storage/              Storage tests
 tests/integration/api/           HTTP tests with real storage
@@ -160,5 +162,29 @@ membership; this does not migrate stored values or provide live membership chang
 
 The tests cover fixed routing examples, exact hash boundaries, wraparound,
 input-order independence, unique owners, caller mutation, and concurrent reads.
-Membership tests verify that adding a node only moves primary ownership to that
-node, and removing a node preserves primary ownership on remaining nodes.
+Ring membership-change tests verify that adding a node only moves primary
+ownership to that node, and removing a node preserves primary ownership on
+remaining nodes.
+
+## Static cluster membership
+
+`cluster.Member` contains an `ID` and an `Address`, such as `node-a` and
+`http://127.0.0.1:8001`. `cluster.NewMembership(members)` validates and copies
+the supplied members into an immutable directory.
+
+- Membership must contain at least one node. IDs must be unique, non-empty,
+  and free of surrounding whitespace.
+- Addresses must be absolute HTTP or HTTPS base URLs with a host. An optional
+  port must be between 1 and 65535. IPv6 hosts must use brackets.
+- An optional root slash is accepted. Credentials, application paths, queries,
+  and fragments are rejected. Accepted address strings are preserved as supplied.
+
+`Lookup(nodeID)` returns `(Member, bool)`, where the boolean indicates whether
+the ID exists. `NodeIDs()` returns a sorted copy suitable for constructing a
+hash ring. Returned members and slices can be changed without modifying the
+directory; concurrent reads need no locks.
+
+Validation checks configuration syntax without DNS lookups or network requests.
+It does not verify reachability or whether different addresses refer to the same
+server. Offline nodes remain members. Startup configuration loading, local node
+identification, and request forwarding are subsequent milestones.
