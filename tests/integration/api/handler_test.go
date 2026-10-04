@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"kvstore/internal/api"
+	"kvstore/internal/routing"
 	"kvstore/internal/storage"
 )
 
@@ -96,7 +97,7 @@ func TestConcurrentKeyLifecycles(t *testing.T) {
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	server := httptest.NewServer(api.NewHandler(storage.NewMemoryStore()))
+	server := httptest.NewServer(api.NewHandler(routing.NewLocalService(storage.NewMemoryStore())))
 	server.Client().Timeout = 5 * time.Second
 	t.Cleanup(server.Close)
 	return server

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,22 +9,26 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"unicode/utf8"
+
+	"kvstore/internal/routing"
 )
 
 const maxRequestBodyBytes = 1 << 20 // 1 MiB, including JSON overhead.
 
-// Store describes the storage operations required by the HTTP API.
+// Service describes the operations required by the HTTP API.
 // Implementations must support concurrent calls from request handlers.
-type Store interface {
-	Put(key, value string)
-	Get(key string) (string, bool)
-	Delete(key string)
+type Service interface {
+	Put(ctx context.Context, key, value string) error
+	Get(ctx context.Context, key string) (string, bool, error)
+	Delete(ctx context.Context, key string) error
 }
 
-// Handler routes HTTP requests to a store. Construct it with NewHandler.
+// Handler validates HTTP requests and invokes a key-value service.
 type Handler struct {
-	store  Store
-	router *http.ServeMux
+	service      Service
+	router       *http.ServeMux
+	maxBodyBytes int64
 }
 
 type putRequest struct {
@@ -40,16 +45,42 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-// NewHandler creates the key-value routes using a non-nil store.
-func NewHandler(store Store) *Handler {
+// NewHandler creates public key-value routes using a non-nil service.
+func NewHandler(service Service) *Handler {
+	return newHandler(service, "/kv/{key}", maxRequestBodyBytes)
+}
+
+// NewInternalHandler creates peer routes that access only the local store.
+func NewInternalHandler(store routing.Store) *Handler {
+	// JSON re-encoding can expand values accepted by the public 1 MiB limit.
+	return newHandler(routing.NewLocalService(store), "/internal/kv/{key}", 8<<20)
+}
+
+func newHandler(service Service, pattern string, maxBodyBytes int64) *Handler {
 	handler := &Handler{
-		store: store,
-		router: http.NewServeMux(),
+		service:      service,
+		maxBodyBytes: maxBodyBytes,
+		router:       http.NewServeMux(),
 	}
-	handler.router.HandleFunc("PUT /kv/{key}", handler.put)
-	handler.router.HandleFunc("GET /kv/{key}", handler.get)
-	handler.router.HandleFunc("DELETE /kv/{key}", handler.delete)
+	handler.router.HandleFunc("PUT "+pattern, validateKey(handler.put))
+	handler.router.HandleFunc("GET "+pattern, validateKey(handler.get))
+	handler.router.HandleFunc("DELETE "+pattern, validateKey(handler.delete))
 	return handler
+}
+
+func validateKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		key := request.PathValue("key")
+		if !utf8.ValidString(key) {
+			writeError(writer, http.StatusBadRequest, "key must be valid UTF-8")
+			return
+		}
+		if len(key) > 4<<10 {
+			writeError(writer, http.StatusRequestURITooLong, "key exceeds 4 KiB")
+			return
+		}
+		next(writer, request)
+	}
 }
 
 // ServeHTTP implements http.Handler by delegating to the configured router.
@@ -66,25 +97,32 @@ func (handler *Handler) put(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	body := http.MaxBytesReader(writer, request.Body, maxRequestBodyBytes)
+	body := http.MaxBytesReader(writer, request.Body, handler.maxBodyBytes)
 	payload, err := decodePutRequest(body)
 	if err != nil {
 		var sizeError *http.MaxBytesError
 		if errors.As(err, &sizeError) {
-			writeError(writer, http.StatusRequestEntityTooLarge, "request body exceeds 1 MiB")
+			writeError(writer, http.StatusRequestEntityTooLarge, "request body exceeds size limit")
 			return
 		}
 		writeError(writer, http.StatusBadRequest, "body must contain one JSON object with a string value and no unknown fields")
 		return
 	}
 
-	handler.store.Put(request.PathValue("key"), *payload.Value)
+	if err := handler.service.Put(request.Context(), request.PathValue("key"), *payload.Value); err != nil {
+		writeServiceError(writer, err)
+		return
+	}
 	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (handler *Handler) get(writer http.ResponseWriter, request *http.Request) {
 	key := request.PathValue("key")
-	value, found := handler.store.Get(key)
+	value, found, err := handler.service.Get(request.Context(), key)
+	if err != nil {
+		writeServiceError(writer, err)
+		return
+	}
 	if !found {
 		writeError(writer, http.StatusNotFound, "key not found")
 		return
@@ -94,8 +132,27 @@ func (handler *Handler) get(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (handler *Handler) delete(writer http.ResponseWriter, request *http.Request) {
-	handler.store.Delete(request.PathValue("key"))
+	if err := handler.service.Delete(request.Context(), request.PathValue("key")); err != nil {
+		writeServiceError(writer, err)
+		return
+	}
 	writer.WriteHeader(http.StatusNoContent)
+}
+
+func writeServiceError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		writeError(writer, http.StatusGatewayTimeout, "owner request timed out")
+	case errors.Is(err, context.Canceled):
+		writeError(writer, http.StatusRequestTimeout, "request canceled")
+	case errors.Is(err, routing.ErrUnavailable):
+		writeError(writer, http.StatusServiceUnavailable, "owner unavailable")
+	case errors.Is(err, routing.ErrInvalidResponse):
+		writeError(writer, http.StatusBadGateway, "invalid owner response")
+	default:
+		slog.Error("key-value operation failed", "error", err)
+		writeError(writer, http.StatusInternalServerError, "internal server error")
+	}
 }
 
 func decodePutRequest(body io.Reader) (putRequest, error) {

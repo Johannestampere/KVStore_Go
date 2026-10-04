@@ -1,12 +1,8 @@
 # kvstore
 
-A concurrent, in-memory key-value store with an HTTP API, written in Go using
-only the standard library. This is the single-node milestone of a project that
-will grow into a small Dynamo-style distributed system.
-
-**Focus of this milestone:** concurrent storage, validated HTTP requests, and
-unit and integration tests. Data is lost when the process stops; replication,
-versioning, and persistence are future milestones.
+A partitioned, in-memory key-value store with an HTTP API, written in Go using
+only the standard library. Any configured node routes a request to the key's
+owner through a shared consistent-hash ring.
 
 ```go
 store := storage.NewMemoryStore()
@@ -24,13 +20,14 @@ Most toy KV stores stop at a map + mutex. This one is written to be a solid foun
 - Race-detector-clean tests that exercise both contended and uncontended paths
 - Zero-value safety and careful handling of edge cases (empty keys/values, Unicode)
 
-The HTTP handler depends on a small storage interface. The node executable
-connects it to `MemoryStore` and manages the server's lifecycle.
+The HTTP handler depends on a small service interface with cancellation and
+error support. The node executable connects it to local storage or cluster
+routing and manages the server's lifecycle.
 
 An immutable consistent-hash ring selects key owners, and a static membership
 directory maps node IDs to HTTP addresses. Startup can load both from a shared
-JSON file. Request forwarding is not implemented yet: each process still stores
-and serves only its own local data.
+JSON file. Each key lives on exactly one owner; other nodes forward requests to
+that owner's internal HTTP endpoint.
 
 ## Quick start
 
@@ -89,34 +86,50 @@ string `value`. Empty values are accepted; missing or null values, unknown
 fields, and extra JSON values are rejected before storage is changed. The
 request-body limit is 1 MiB including JSON overhead.
 
-Keys must occupy one non-empty URL path segment. URL-escape reserved characters;
+Keys must be valid UTF-8 (`400` otherwise) and occupy one non-empty URL path
+segment, with at most 4 KiB of decoded
+key bytes (`414` if exceeded). URL-escape reserved characters;
 for example, the key `user/42` uses `/kv/user%2F42`. Handler errors use
 `{"error":"message"}`. Unknown routes and unsupported methods use the standard
 router's responses. GET routes also support HEAD through Go's HTTP server.
+Keys consisting of `.` or `..` must use `%2E` or `%2E%2E` to avoid path cleaning.
+
+In cluster mode, any operation can return `503` if its owner is unavailable,
+`504` if the peer request times out, or `502` for an invalid peer response.
+A missing key returns `404` only after a successful lookup on its owner.
 
 ## Cluster startup configuration
 
 `configs/cluster.local.json` lists five local nodes on ports 8001–8005 with 64
-virtual positions per node. Run a node with its configured identity:
+virtual positions per node. Start all five in separate terminals:
 
 ```bash
 go run ./cmd/node -config configs/cluster.local.json -id node-a -addr 127.0.0.1:8001
+go run ./cmd/node -config configs/cluster.local.json -id node-b -addr 127.0.0.1:8002
+go run ./cmd/node -config configs/cluster.local.json -id node-c -addr 127.0.0.1:8003
+go run ./cmd/node -config configs/cluster.local.json -id node-d -addr 127.0.0.1:8004
+go run ./cmd/node -config configs/cluster.local.json -id node-e -addr 127.0.0.1:8005
 ```
 
-In another terminal, a second process can use the same file:
+Write through one node and read or delete through another:
 
 ```bash
-go run ./cmd/node -config configs/cluster.local.json -id node-b -addr 127.0.0.1:8002
+curl -i -X PUT http://127.0.0.1:8001/kv/user:42 \
+  -H 'Content-Type: application/json' -d '{"value":"Alice"}'
+curl -i http://127.0.0.1:8003/kv/user:42
+curl -i -X DELETE http://127.0.0.1:8005/kv/user:42
 ```
 
-**These processes do not yet forward or replicate requests.** Configuration loads
-membership and validates the hash ring; all HTTP operations remain local.
+Expect `204`, `200` with Alice's value, then `204`. All three requests resolve
+to the same owner. Starting only part of the configured cluster leaves keys
+assigned to the other nodes unavailable.
 
 | Flag | Purpose | Default |
 | --- | --- | --- |
 | `-addr` | Local listening address | `127.0.0.1:8001` |
 | `-config` | Shared cluster JSON file | No cluster configuration |
 | `-id` | Local member ID from that file | None |
+| `-peer-timeout` | Positive timeout for each outgoing peer request | `2s` |
 
 `-config` and `-id` must be supplied together. The local ID must exist in the
 member list. `-addr` remains independent of the advertised member address and
@@ -132,12 +145,46 @@ restarting the process. Every node must use the same topology settings.
 
 Omit both cluster flags to retain the original single-node startup behavior.
 
+## Request routing
+
+```text
+Client → public /kv/{key} → Router → first owner on the hash ring
+                                      ├─ local: LocalService → MemoryStore
+                                      └─ remote: HTTPNodeClient
+                                                   ↓
+                                         /internal/kv/{key}
+                                                   ↓
+                                         LocalService → MemoryStore
+```
+
+`Router.Put`, `Get`, and `Delete` select one owner and choose local or remote
+access. `LocalService` adapts the existing storage methods to the service
+interface. Methods receive `context.Context` (Go's cancellation/deadline
+signal) and return errors separately from missing-key results.
+
+`HTTPNodeClient` reuses connections, propagates request cancellation, and bounds
+the complete peer exchange with `-peer-timeout`, including reading the response.
+It validates response status, JSON, and returned key, and refuses redirects.
+There are no application-level retries or fallback owners.
+
+Cluster mode exposes `PUT`, `GET`, and `DELETE /internal/kv/{key}` for direct
+local access. These endpoints bypass routing, preventing forwarding loops;
+they are a peer protocol, not the public client API. Standalone mode does not
+expose them. Internal request and peer response limits are 8 MiB to accommodate
+JSON escaping of values accepted under the public 1 MiB limit.
+
+Ownership is static: an outage does not move keys, and an offline owner makes
+its keys unavailable. A timed-out write or delete may already have taken effect;
+a timeout does not imply rollback. Replication, quorums, versioning, persistence,
+and data migration are not implemented yet.
+
 ## Tests
 
-Unit tests exercise storage, HTTP behavior, consistent hashing, membership, and
-configuration loading.
-Integration tests connect the real handler and store through a local HTTP server,
-covering key lifecycles, rejected writes, and concurrent clients.
+Unit tests exercise storage, HTTP behavior, consistent hashing, membership,
+configuration loading, owner selection, and the peer protocol.
+Integration tests run real HTTP servers and storage, covering cross-node key
+lifecycles, single-owner placement, concurrent clients, escaped keys, large
+values, unavailable owners, timeouts, and internal endpoint isolation.
 
 ```bash
 go vet ./...
@@ -159,14 +206,20 @@ internal/api/handler.go          HTTP routing and validation
 internal/cluster/membership.go   Static node IDs and HTTP addresses
 internal/config/config.go        Shared JSON configuration and local identity
 internal/consistenthash/ring.go   Deterministic key ownership
+internal/routing/local.go        Local storage adapter with cancellation support
+internal/routing/router.go       Owner selection and local/remote dispatch
+internal/transport/http.go       Bounded peer HTTP client
 internal/storage/memory.go       Concurrent in-memory storage
 configs/cluster.local.json       Five-node local topology
-tests/unit/api/                  Handler tests with a storage spy
+tests/unit/api/                  Handler tests with a service spy
 tests/unit/cluster/              Membership validation and lookup tests
 tests/unit/config/               Configuration loading tests
 tests/unit/consistenthash/       Hash-ring behavior and concurrency tests
 tests/unit/storage/              Storage tests
+tests/unit/routing/              Owner selection and failure tests
+tests/unit/transport/            Peer protocol and cancellation tests
 tests/integration/api/           HTTP tests with real storage
+tests/integration/routing/       Cross-node HTTP tests
 ```
 
 ## Storage contract
@@ -229,5 +282,5 @@ directory; concurrent reads need no locks.
 
 Validation checks configuration syntax without DNS lookups or network requests.
 It does not verify reachability or whether different addresses refer to the same
-server. Offline nodes remain members. Startup loads the directory and identifies
-the local node; request forwarding is the next milestone.
+server. Offline nodes remain members. Startup loads the directory, identifies
+the local node, and connects the shared topology to request routing.
