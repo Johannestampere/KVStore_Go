@@ -67,7 +67,18 @@ func TestCrossNodeKeyLifecycles(t *testing.T) {
 					}
 				}
 			}
+			previous, found := owner.store.GetRecord(key)
+			if !found || previous.Deleted || previous.Version.NodeID != owner.id {
+				t.Fatalf("owner did not assign a version: %+v", previous)
+			}
 			request(t, entry, http.MethodDelete, target, "", http.StatusNoContent)
+			deleted, found := owner.store.GetRecord(key)
+			if !found || !deleted.Deleted || deleted.Value != "" || deleted.Version.Compare(previous.Version) <= 0 {
+				t.Fatalf("delete did not retain a newer marker: %+v", deleted)
+			}
+			if applied, err := owner.store.Apply(previous); applied || err != nil {
+				t.Fatalf("stale write after HTTP delete = (%v, %v)", applied, err)
+			}
 			for _, node := range cluster.nodes {
 				request(t, node, http.MethodGet, target, "", http.StatusNotFound)
 			}
@@ -151,7 +162,11 @@ func newCluster(t *testing.T, timeout time.Duration, overrides map[string]http.H
 	for _, id := range []string{"a", "b", "c"} {
 		server := httptest.NewUnstartedServer(nil)
 		t.Cleanup(server.Close)
-		result.nodes = append(result.nodes, &testNode{id: id, server: server, store: storage.NewMemoryStore()})
+		store, err := storage.NewMemoryStore(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result.nodes = append(result.nodes, &testNode{id: id, server: server, store: store})
 		members = append(members, cluster.Member{ID: id, Address: "http://" + server.Listener.Addr().String()})
 	}
 	membership, err := cluster.NewMembership(members)

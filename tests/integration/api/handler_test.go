@@ -97,7 +97,11 @@ func TestConcurrentKeyLifecycles(t *testing.T) {
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	server := httptest.NewServer(api.NewHandler(routing.NewLocalService(storage.NewMemoryStore())))
+	store, err := storage.NewMemoryStore("test-node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(api.NewHandler(routing.NewLocalService(store)))
 	server.Client().Timeout = 5 * time.Second
 	t.Cleanup(server.Close)
 	return server

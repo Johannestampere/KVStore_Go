@@ -5,9 +5,9 @@ import "context"
 
 // Store provides concurrent node-local storage.
 type Store interface {
-	Put(key, value string)
+	Put(key, value string) error
 	Get(key string) (string, bool)
-	Delete(key string)
+	Delete(key string) error
 }
 
 // LocalService adapts local storage to cancellable application operations.
@@ -25,8 +25,7 @@ func (service *LocalService) Put(ctx context.Context, key, value string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	service.store.Put(key, value)
-	return nil
+	return service.store.Put(key, value)
 }
 
 // Get reads a value unless the request is already canceled.
@@ -43,6 +42,5 @@ func (service *LocalService) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	service.store.Delete(key)
-	return nil
+	return service.store.Delete(key)
 }

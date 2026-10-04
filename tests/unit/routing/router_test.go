@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 
 	"kvstore/internal/cluster"
@@ -36,6 +37,21 @@ func (client *nodeClientSpy) Delete(ctx context.Context, member cluster.Member, 
 	client.calls++
 	client.ctx, client.member, client.key = ctx, member, key
 	return client.err
+}
+
+func TestLocalServicePropagatesStorageErrors(t *testing.T) {
+	_, store, _ := newOptions(t)
+	record := storage.Record{Key: "key", Version: storage.Version{Counter: math.MaxUint64, NodeID: "remote"}}
+	if _, err := store.Apply(record); err != nil {
+		t.Fatal(err)
+	}
+	service := routing.NewLocalService(store)
+	if err := service.Put(t.Context(), "key", "value"); !errors.Is(err, storage.ErrVersionExhausted) {
+		t.Fatalf("Put error = %v", err)
+	}
+	if err := service.Delete(t.Context(), "key"); !errors.Is(err, storage.ErrVersionExhausted) {
+		t.Fatalf("Delete error = %v", err)
+	}
 }
 
 func TestRouterLocalLifecycle(t *testing.T) {
@@ -94,7 +110,9 @@ func TestRouterDoesNotFallBackOnPeerFailure(t *testing.T) {
 			client.err = failure
 			router := mustRouter(t, options)
 			key := keyForOwner(t, options.Ring, "b")
-			store.Put(key, "stale local value")
+			if err := store.Put(key, "stale local value"); err != nil {
+				t.Fatal(err)
+			}
 			if err := router.Put(t.Context(), key, "new"); !errors.Is(err, failure) {
 				t.Fatalf("Put error = %v", err)
 			}
@@ -122,7 +140,9 @@ func TestCanceledOperationsDoNotAccessStorageOrPeers(t *testing.T) {
 	for _, service := range services {
 		for _, owner := range []string{"a", "b"} {
 			key := keyForOwner(t, options.Ring, owner)
-			store.Put(key, "original")
+			if err := store.Put(key, "original"); err != nil {
+				t.Fatal(err)
+			}
 			if err := service.Put(ctx, key, "new"); !errors.Is(err, context.Canceled) {
 				t.Fatalf("Put error = %v", err)
 			}
@@ -190,7 +210,11 @@ func newOptions(t *testing.T) (routing.Options, *storage.MemoryStore, *nodeClien
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, client := storage.NewMemoryStore(), &nodeClientSpy{}
+	store, err := storage.NewMemoryStore("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &nodeClientSpy{}
 	return routing.Options{LocalID: "a", Store: store, Membership: membership, Ring: ring, Client: client}, store, client
 }
 

@@ -5,10 +5,17 @@ only the standard library. Any configured node routes a request to the key's
 owner through a shared consistent-hash ring.
 
 ```go
-store := storage.NewMemoryStore()
-store.Put("user:42", "alice")
+store, err := storage.NewMemoryStore("node-a")
+if err != nil {
+    return err
+}
+if err := store.Put("user:42", "alice"); err != nil {
+    return err
+}
 value, ok := store.Get("user:42") // "alice", true
-store.Delete("user:42")
+if err := store.Delete("user:42"); err != nil {
+    return err
+}
 ```
 
 ## Why this exists
@@ -18,7 +25,8 @@ Most toy KV stores stop at a map + mutex. This one is written to be a solid foun
 - Explicit storage contract that distinguishes missing keys from empty values
 - Proper use of `sync.RWMutex` (readers don’t block each other)
 - Race-detector-clean tests that exercise both contended and uncontended paths
-- Zero-value safety and careful handling of edge cases (empty keys/values, Unicode)
+- Versioned records and deletion markers that reject stale updates
+- Careful handling of edge cases (empty keys/values, Unicode)
 
 The HTTP handler depends on a small service interface with cancellation and
 error support. The node executable connects it to local storage or cluster
@@ -175,13 +183,15 @@ JSON escaping of values accepted under the public 1 MiB limit.
 
 Ownership is static: an outage does not move keys, and an offline owner makes
 its keys unavailable. A timed-out write or delete may already have taken effect;
-a timeout does not imply rollback. Replication, quorums, versioning, persistence,
+a timeout does not imply rollback. Replication, quorums, persistence,
 and data migration are not implemented yet.
 
 ## Tests
 
 Unit tests exercise storage, HTTP behavior, consistent hashing, membership,
 configuration loading, owner selection, and the peer protocol.
+Storage tests cover version ordering, duplicate and conflicting updates,
+deletion markers, counter exhaustion, and concurrent version assignment.
 Integration tests run real HTTP servers and storage, covering cross-node key
 lifecycles, single-owner placement, concurrent clients, escaped keys, large
 values, unavailable owners, timeouts, and internal endpoint isolation.
@@ -209,7 +219,8 @@ internal/consistenthash/ring.go   Deterministic key ownership
 internal/routing/local.go        Local storage adapter with cancellation support
 internal/routing/router.go       Owner selection and local/remote dispatch
 internal/transport/http.go       Bounded peer HTTP client
-internal/storage/memory.go       Concurrent in-memory storage
+internal/storage/memory.go       Concurrent versioned storage and logical counter
+internal/storage/record.go       Records, deletion markers, and version ordering
 configs/cluster.local.json       Five-node local topology
 tests/unit/api/                  Handler tests with a service spy
 tests/unit/cluster/              Membership validation and lookup tests
@@ -226,11 +237,55 @@ tests/integration/routing/       Cross-node HTTP tests
 
 | Operation | Behavior |
 | --- | --- |
-| `Put(key, value)` | Insert or overwrite |
+| `Put(key, value)` | Insert or overwrite with a new local version; returns an error on failure |
 | `Get(key)` | `(value, true)` if present, `("", false)` if missing |
-| `Delete(key)` | Remove the key; missing key is a no-op |
+| `Delete(key)` | Write a new deletion marker, including for absent keys; returns an error on failure |
+| `GetRecord(key)` | Return the complete record, including deletion markers, and a found flag |
+| `Apply(record)` | Atomically accept a newer record; return whether storage changed and an error |
 
 Empty keys and values are allowed. The `found` boolean is the only reliable way to distinguish a stored empty string from a missing key. Operations are individually synchronized; there are no multi-key transactions.
+
+Construct storage with `NewMemoryStore(nodeID)`, which validates the writer's
+identity. A zero-value store rejects local writes because it has no node ID.
+Cluster startup uses the configured ID; standalone startup uses `standalone`.
+The HTTP response format and status codes remain unchanged.
+
+## Versioned records
+
+Each `Record` contains a key, string value, `Version`, and `Deleted` flag.
+Versions compare the unsigned logical counter first, then the node ID in lexical
+order. For example, `(8, node-a)` follows `(7, node-z)`, and `(8, node-b)` wins a
+tie with `(8, node-a)`. These rules give all replicas the same comparison result;
+they do not measure wall-clock time or establish strong consistency.
+
+The store maintains one counter across keys. A local PUT or DELETE increments
+it under the same lock that updates the record. Applying a remote record raises
+the counter to at least the received value, so the next local update follows
+every version the store has accepted. Counter overflow returns an error without
+changing storage.
+
+`Apply` ignores older records and identical retries. A different value or
+deletion flag with the same key and exact version returns `ErrVersionConflict`;
+one version must identify one update. Invalid records are rejected before
+storage changes. Records contain strings and value fields, so returned copies
+cannot mutate storage.
+
+DELETE retains a **tombstone**, a record with `Deleted: true` and an empty value.
+`Get` treats it as missing, while `GetRecord` exposes it for future replication.
+An older value cannot overwrite that marker; a newer PUT can recreate the key.
+Repeated deletes create newer markers even when the key is already absent.
+Tombstones are retained indefinitely for now and consume memory.
+
+This milestone adds the storage foundation only. Peer HTTP calls still carry
+plain values; the selected owner assigns their versions. The next replication
+milestone must assign one version per update and send that same record to each
+replica. It must also observe replica versions before generating updates where
+needed. An independent counter alone cannot reveal unseen writes on other nodes.
+
+Records and counters are currently in memory. Restarting a node loses both and
+can reuse versions under the same node ID. Before supporting replication across
+restarts, recovery must restore the counter and records or introduce a durable
+writer epoch. There is no replica repair or convergence mechanism yet.
 
 ## Consistent hashing
 

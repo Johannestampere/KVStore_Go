@@ -91,7 +91,14 @@ func run(arguments []string) error {
 }
 
 func buildHandler(options nodeOptions, peerClient routing.NodeClient) (http.Handler, error) {
-	store := storage.NewMemoryStore()
+	nodeID := options.nodeID
+	if nodeID == "" {
+		nodeID = "standalone"
+	}
+	store, err := storage.NewMemoryStore(nodeID)
+	if err != nil {
+		return nil, err
+	}
 	if options.configPath == "" {
 		return api.NewHandler(routing.NewLocalService(store)), nil
 	}
