@@ -16,7 +16,8 @@ import (
 	"time"
 
 	"kvstore/internal/cluster"
-	"kvstore/internal/routing"
+	"kvstore/internal/replication"
+	"kvstore/internal/storage"
 )
 
 const maxResponseBytes = 8 << 20
@@ -45,15 +46,16 @@ func (client *HTTPNodeClient) CloseIdleConnections() {
 	client.client.CloseIdleConnections()
 }
 
-// Put writes through the owner's internal endpoint.
-func (client *HTTPNodeClient) Put(ctx context.Context, member cluster.Member, key, value string) error {
-	payload, err := json.Marshal(struct {
-		Value string `json:"value"`
-	}{Value: value})
-	if err != nil {
-		return fmt.Errorf("encode peer PUT: %w", err)
+// Apply sends an unchanged record; only an accepted record or identical retry succeeds.
+func (client *HTTPNodeClient) Apply(ctx context.Context, member cluster.Member, record storage.Record) error {
+	if err := record.Validate(); err != nil {
+		return err
 	}
-	request, err := peerRequest(ctx, member, http.MethodPut, key, payload)
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("encode replica record: %w", err)
+	}
+	request, err := peerRequest(ctx, member, http.MethodPut, record.Key, payload)
 	if err != nil {
 		return err
 	}
@@ -61,43 +63,30 @@ func (client *HTTPNodeClient) Put(ctx context.Context, member cluster.Member, ke
 	return err
 }
 
-// Get reads a value or an explicit missing-key response from the owner.
-func (client *HTTPNodeClient) Get(ctx context.Context, member cluster.Member, key string) (string, bool, error) {
+// GetRecord reads a complete record, including deletion markers.
+func (client *HTTPNodeClient) GetRecord(ctx context.Context, member cluster.Member, key string) (storage.Record, bool, error) {
 	request, err := peerRequest(ctx, member, http.MethodGet, key, nil)
 	if err != nil {
-		return "", false, err
+		return storage.Record{}, false, err
 	}
 	body, status, err := client.execute(request, http.StatusOK)
 	if err != nil {
-		return "", false, err
+		return storage.Record{}, false, err
 	}
 	if status == http.StatusNotFound {
 		var missing struct {
 			Error string `json:"error"`
 		}
 		if err := json.Unmarshal(body, &missing); err != nil || missing.Error != "key not found" {
-			return "", false, fmt.Errorf("%w: invalid missing-key response", routing.ErrInvalidResponse)
+			return storage.Record{}, false, fmt.Errorf("%w: invalid missing-key response", replication.ErrInvalidResponse)
 		}
-		return "", false, nil
+		return storage.Record{}, false, nil
 	}
-	var result struct {
-		Key   *string `json:"key"`
-		Value *string `json:"value"`
+	record, err := replication.DecodeRecord(bytes.NewReader(body))
+	if err != nil || record.Key != key {
+		return storage.Record{}, false, fmt.Errorf("%w: invalid record", replication.ErrInvalidResponse)
 	}
-	if err := json.Unmarshal(body, &result); err != nil || result.Key == nil || *result.Key != key || result.Value == nil {
-		return "", false, fmt.Errorf("%w: invalid record", routing.ErrInvalidResponse)
-	}
-	return *result.Value, true, nil
-}
-
-// Delete removes the key through the owner's internal endpoint.
-func (client *HTTPNodeClient) Delete(ctx context.Context, member cluster.Member, key string) error {
-	request, err := peerRequest(ctx, member, http.MethodDelete, key, nil)
-	if err != nil {
-		return err
-	}
-	_, _, err = client.execute(request, http.StatusNoContent)
-	return err
+	return record, true, nil
 }
 
 func peerRequest(ctx context.Context, member cluster.Member, method, key string, body []byte) (*http.Request, error) {
@@ -105,7 +94,7 @@ func peerRequest(ctx context.Context, member cluster.Member, method, key string,
 	if key == "." || key == ".." {
 		escapedKey = strings.ReplaceAll(key, ".", "%2E")
 	}
-	target := strings.TrimSuffix(member.Address, "/") + "/internal/kv/" + escapedKey
+	target := strings.TrimSuffix(member.Address, "/") + "/internal/records/" + escapedKey
 	request, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request for node %q: %w", member.ID, err)
@@ -122,7 +111,7 @@ func (client *HTTPNodeClient) execute(request *http.Request, expected int) ([]by
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, 0, err
 		}
-		return nil, 0, fmt.Errorf("%w: %w", routing.ErrUnavailable, err)
+		return nil, 0, fmt.Errorf("%w: %w", replication.ErrUnavailable, err)
 	}
 	defer func() {
 		if err := response.Body.Close(); err != nil {
@@ -130,29 +119,46 @@ func (client *HTTPNodeClient) execute(request *http.Request, expected int) ([]by
 		}
 	}()
 	if response.StatusCode == http.StatusServiceUnavailable {
-		return nil, 0, routing.ErrUnavailable
+		return nil, 0, replication.ErrUnavailable
 	}
 	if response.StatusCode == http.StatusGatewayTimeout {
 		return nil, 0, context.DeadlineExceeded
 	}
 	missing := request.Method == http.MethodGet && response.StatusCode == http.StatusNotFound
-	if response.StatusCode != expected && !missing {
-		return nil, 0, fmt.Errorf("%w: HTTP %d", routing.ErrInvalidResponse, response.StatusCode)
+	conflict := request.Method == http.MethodPut && response.StatusCode == http.StatusConflict
+	if response.StatusCode != expected && !missing && !conflict {
+		return nil, 0, fmt.Errorf("%w: HTTP %d", replication.ErrInvalidResponse, response.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, 0, err
 		}
-		return nil, 0, fmt.Errorf("%w: read body: %w", routing.ErrInvalidResponse, err)
+		return nil, 0, fmt.Errorf("%w: read body: %w", replication.ErrInvalidResponse, err)
 	}
 	if len(body) > maxResponseBytes {
-		return nil, 0, fmt.Errorf("%w: response exceeds 8 MiB", routing.ErrInvalidResponse)
+		return nil, 0, fmt.Errorf("%w: response exceeds 8 MiB", replication.ErrInvalidResponse)
 	}
-	if expected == http.StatusOK {
+	if expected == http.StatusOK || conflict {
 		mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 		if err != nil || mediaType != "application/json" {
-			return nil, 0, fmt.Errorf("%w: expected JSON", routing.ErrInvalidResponse)
+			return nil, 0, fmt.Errorf("%w: expected JSON", replication.ErrInvalidResponse)
+		}
+	}
+	if conflict {
+		var failure struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(body, &failure); err != nil {
+			return nil, 0, replication.ErrInvalidResponse
+		}
+		switch failure.Error {
+		case "record version is stale":
+			return nil, 0, storage.ErrStaleRecord
+		case "conflicting record for version":
+			return nil, 0, storage.ErrVersionConflict
+		default:
+			return nil, 0, replication.ErrInvalidResponse
 		}
 	}
 	return body, response.StatusCode, nil

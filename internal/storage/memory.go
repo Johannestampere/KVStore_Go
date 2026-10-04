@@ -10,6 +10,9 @@ import (
 // ErrVersionConflict indicates different records with the same key and version.
 var ErrVersionConflict = errors.New("conflicting record for version")
 
+// ErrStaleRecord indicates that a newer version is already stored.
+var ErrStaleRecord = errors.New("record version is stale")
+
 // ErrVersionExhausted indicates that the logical counter cannot advance.
 var ErrVersionExhausted = errors.New("version counter exhausted")
 
@@ -58,8 +61,8 @@ func (store *MemoryStore) Delete(key string) error {
 	return store.writeLocal(Record{Key: key, Deleted: true})
 }
 
-// Apply stores a newer record atomically. Stale or identical records return false.
-// Reusing a version for different contents returns ErrVersionConflict.
+// Apply stores a newer record atomically; identical retries return false, nil.
+// Stale records and conflicting contents return errors without changing storage.
 func (store *MemoryStore) Apply(record Record) (bool, error) {
 	if err := record.Validate(); err != nil {
 		return false, fmt.Errorf("apply record %q: %w", record.Key, err)
@@ -70,7 +73,7 @@ func (store *MemoryStore) Apply(record Record) (bool, error) {
 	if current, found := store.records[record.Key]; found {
 		switch record.Version.Compare(current.Version) {
 		case -1:
-			return false, nil
+			return false, ErrStaleRecord
 		case 0:
 			if record != current {
 				return false, fmt.Errorf("apply record %q: %w", record.Key, ErrVersionConflict)
@@ -87,16 +90,32 @@ func (store *MemoryStore) writeLocal(record Record) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if store.nodeID == "" {
-		return errors.New("local writes require a store created with NewMemoryStore")
+	version, err := store.nextVersion(Version{})
+	if err != nil {
+		return err
 	}
-	if store.counter == math.MaxUint64 {
-		return ErrVersionExhausted
-	}
-	store.counter++
-	record.Version = Version{Counter: store.counter, NodeID: store.nodeID}
+	record.Version = version
 	store.save(record)
 	return nil
+}
+
+// NextVersion reserves a local version beyond observed without storing a value.
+func (store *MemoryStore) NextVersion(observed Version) (Version, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.nextVersion(observed)
+}
+
+func (store *MemoryStore) nextVersion(observed Version) (Version, error) {
+	if store.nodeID == "" {
+		return Version{}, errors.New("local writes require a store created with NewMemoryStore")
+	}
+	store.counter = max(store.counter, observed.Counter)
+	if store.counter == math.MaxUint64 {
+		return Version{}, ErrVersionExhausted
+	}
+	store.counter++
+	return Version{Counter: store.counter, NodeID: store.nodeID}, nil
 }
 
 // save requires the write lock; values and versions must change together.

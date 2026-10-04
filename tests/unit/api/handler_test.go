@@ -13,7 +13,8 @@ import (
 	"testing"
 
 	"kvstore/internal/api"
-	"kvstore/internal/routing"
+	"kvstore/internal/replication"
+	"kvstore/internal/storage"
 )
 
 type serviceCall struct {
@@ -54,10 +55,12 @@ func TestHandlerServiceErrors(t *testing.T) {
 		err    error
 		status int
 	}{
-		{"unavailable", routing.ErrUnavailable, http.StatusServiceUnavailable},
+		{"unavailable", replication.ErrUnavailable, http.StatusServiceUnavailable},
 		{"deadline", context.DeadlineExceeded, http.StatusGatewayTimeout},
 		{"canceled", context.Canceled, http.StatusRequestTimeout},
-		{"invalid response", routing.ErrInvalidResponse, http.StatusBadGateway},
+		{"invalid response", replication.ErrInvalidResponse, http.StatusBadGateway},
+		{"stale", storage.ErrStaleRecord, http.StatusConflict},
+		{"conflict", storage.ErrVersionConflict, http.StatusConflict},
 		{"unexpected", errors.New("private failure detail"), http.StatusInternalServerError},
 	}
 	for _, testCase := range cases {

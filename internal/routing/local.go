@@ -1,4 +1,4 @@
-// Package routing directs key-value operations to their assigned owner.
+// Package routing adapts local storage to the key-value service interface.
 package routing
 
 import "context"

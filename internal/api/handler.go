@@ -11,7 +11,8 @@ import (
 	"net/http"
 	"unicode/utf8"
 
-	"kvstore/internal/routing"
+	"kvstore/internal/replication"
+	"kvstore/internal/storage"
 )
 
 const maxRequestBodyBytes = 1 << 20 // 1 MiB, including JSON overhead.
@@ -26,9 +27,8 @@ type Service interface {
 
 // Handler validates HTTP requests and invokes a key-value service.
 type Handler struct {
-	service      Service
-	router       *http.ServeMux
-	maxBodyBytes int64
+	service Service
+	router  *http.ServeMux
 }
 
 type putRequest struct {
@@ -47,24 +47,10 @@ type errorResponse struct {
 
 // NewHandler creates public key-value routes using a non-nil service.
 func NewHandler(service Service) *Handler {
-	return newHandler(service, "/kv/{key}", maxRequestBodyBytes)
-}
-
-// NewInternalHandler creates peer routes that access only the local store.
-func NewInternalHandler(store routing.Store) *Handler {
-	// JSON re-encoding can expand values accepted by the public 1 MiB limit.
-	return newHandler(routing.NewLocalService(store), "/internal/kv/{key}", 8<<20)
-}
-
-func newHandler(service Service, pattern string, maxBodyBytes int64) *Handler {
-	handler := &Handler{
-		service:      service,
-		maxBodyBytes: maxBodyBytes,
-		router:       http.NewServeMux(),
-	}
-	handler.router.HandleFunc("PUT "+pattern, validateKey(handler.put))
-	handler.router.HandleFunc("GET "+pattern, validateKey(handler.get))
-	handler.router.HandleFunc("DELETE "+pattern, validateKey(handler.delete))
+	handler := &Handler{service: service, router: http.NewServeMux()}
+	handler.router.HandleFunc("PUT /kv/{key}", validateKey(handler.put))
+	handler.router.HandleFunc("GET /kv/{key}", validateKey(handler.get))
+	handler.router.HandleFunc("DELETE /kv/{key}", validateKey(handler.delete))
 	return handler
 }
 
@@ -97,7 +83,7 @@ func (handler *Handler) put(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	body := http.MaxBytesReader(writer, request.Body, handler.maxBodyBytes)
+	body := http.MaxBytesReader(writer, request.Body, maxRequestBodyBytes)
 	payload, err := decodePutRequest(body)
 	if err != nil {
 		var sizeError *http.MaxBytesError
@@ -142,13 +128,17 @@ func (handler *Handler) delete(writer http.ResponseWriter, request *http.Request
 func writeServiceError(writer http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		writeError(writer, http.StatusGatewayTimeout, "owner request timed out")
+		writeError(writer, http.StatusGatewayTimeout, "replica request timed out")
 	case errors.Is(err, context.Canceled):
 		writeError(writer, http.StatusRequestTimeout, "request canceled")
-	case errors.Is(err, routing.ErrUnavailable):
-		writeError(writer, http.StatusServiceUnavailable, "owner unavailable")
-	case errors.Is(err, routing.ErrInvalidResponse):
-		writeError(writer, http.StatusBadGateway, "invalid owner response")
+	case errors.Is(err, replication.ErrUnavailable):
+		writeError(writer, http.StatusServiceUnavailable, "replica unavailable")
+	case errors.Is(err, replication.ErrInvalidResponse):
+		writeError(writer, http.StatusBadGateway, "invalid replica response")
+	case errors.Is(err, storage.ErrStaleRecord):
+		writeError(writer, http.StatusConflict, "record version is stale")
+	case errors.Is(err, storage.ErrVersionConflict):
+		writeError(writer, http.StatusConflict, "conflicting record for version")
 	default:
 		slog.Error("key-value operation failed", "error", err)
 		writeError(writer, http.StatusInternalServerError, "internal server error")

@@ -15,16 +15,18 @@ import (
 
 	"kvstore/internal/api"
 	"kvstore/internal/config"
+	"kvstore/internal/replication"
 	"kvstore/internal/routing"
 	"kvstore/internal/storage"
 	"kvstore/internal/transport"
 )
 
 type nodeOptions struct {
-	address     string
-	configPath  string
-	nodeID      string
-	peerTimeout time.Duration
+	address        string
+	configPath     string
+	nodeID         string
+	peerTimeout    time.Duration
+	requestTimeout time.Duration
 }
 
 func main() {
@@ -90,7 +92,7 @@ func run(arguments []string) error {
 	return nil
 }
 
-func buildHandler(options nodeOptions, peerClient routing.NodeClient) (http.Handler, error) {
+func buildHandler(options nodeOptions, peerClient replication.ReplicaClient) (http.Handler, error) {
 	nodeID := options.nodeID
 	if nodeID == "" {
 		nodeID = "standalone"
@@ -106,18 +108,19 @@ func buildHandler(options nodeOptions, peerClient routing.NodeClient) (http.Hand
 	if err != nil {
 		return nil, err
 	}
-	ownerRouter, err := routing.NewRouter(routing.Options{
+	coordinator, err := replication.NewCoordinator(replication.Options{
 		LocalID: topology.Local.ID, Store: store, Membership: topology.Membership,
 		Ring: topology.Ring, Client: peerClient,
+		ReplicationFactor: topology.ReplicationFactor, Timeout: options.requestTimeout,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("configure routing: %w", err)
+		return nil, fmt.Errorf("configure replication: %w", err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/internal/", api.NewInternalHandler(store))
-	mux.Handle("/", api.NewHandler(ownerRouter))
-	slog.Info("cluster routing configured", "node_id", topology.Local.ID,
-		"advertised_address", topology.Local.Address, "members", len(topology.Membership.NodeIDs()))
+	mux.Handle("/internal/", api.NewReplicaHandler(store))
+	mux.Handle("/", api.NewHandler(coordinator))
+	slog.Info("cluster replication configured", "node_id", topology.Local.ID,
+		"advertised_address", topology.Local.Address, "members", len(topology.Membership.NodeIDs()), "replicas", topology.ReplicationFactor)
 	return mux, nil
 }
 
@@ -128,6 +131,7 @@ func parseOptions(arguments []string) (nodeOptions, error) {
 	flags.StringVar(&options.configPath, "config", "", "shared cluster JSON file")
 	flags.StringVar(&options.nodeID, "id", "", "local node ID from the cluster configuration")
 	flags.DurationVar(&options.peerTimeout, "peer-timeout", 2*time.Second, "maximum duration of a peer request")
+	flags.DurationVar(&options.requestTimeout, "request-timeout", 5*time.Second, "maximum duration of a coordinated operation (below 10s)")
 	if err := flags.Parse(arguments); err != nil {
 		return nodeOptions{}, err
 	}
@@ -139,6 +143,9 @@ func parseOptions(arguments []string) (nodeOptions, error) {
 	}
 	if options.peerTimeout <= 0 {
 		return nodeOptions{}, errors.New("-peer-timeout must be positive")
+	}
+	if options.requestTimeout <= 0 || options.requestTimeout >= 10*time.Second {
+		return nodeOptions{}, errors.New("-request-timeout must be positive and below the 10s server write timeout")
 	}
 	if (options.configPath == "") != (options.nodeID == "") {
 		return nodeOptions{}, errors.New("-config and -id must be supplied together")

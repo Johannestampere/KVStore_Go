@@ -1,5 +1,6 @@
 {
   "virtual_nodes": 64,
+  "replication_factor": 3,
   "members": [
     {"id": "node-a", "address": "http://127.0.0.1:8001"},
     {"id": "node-b", "address": "http://127.0.0.1:8002"},

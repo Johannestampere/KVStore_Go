@@ -33,6 +33,9 @@ func TestLoadSelectsLocalMember(t *testing.T) {
 		if loaded.Local != expected {
 			t.Errorf("local member = %v, want %v", loaded.Local, expected)
 		}
+		if loaded.ReplicationFactor != 3 {
+			t.Errorf("default replication factor = %d", loaded.ReplicationFactor)
+		}
 		if ids := loaded.Membership.NodeIDs(); !slices.Equal(ids, expectedIDs) {
 			t.Errorf("membership IDs = %v, want %v", ids, expectedIDs)
 		}
@@ -96,6 +99,23 @@ func TestLoadRejectsUnknownLocalNode(t *testing.T) {
 	}
 }
 
+func TestLoadValidatesReplicationFactor(t *testing.T) {
+	for _, factor := range []string{"0", "-1", "2", "null", "1.5"} {
+		body := `{"virtual_nodes":8,"replication_factor":` + factor + `,"members":[{"id":"node-a","address":"http://localhost:8001"}]}`
+		if _, err := config.Load(writeConfig(t, body), "node-a"); err == nil {
+			t.Errorf("accepted factor %s", factor)
+		}
+	}
+	body := `{"virtual_nodes":8,"replication_factor":1,"members":[{"id":"node-a","address":"http://localhost:8001"}]}`
+	loaded, err := config.Load(writeConfig(t, body), "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ReplicationFactor != 1 {
+		t.Fatalf("explicit factor = %d", loaded.ReplicationFactor)
+	}
+}
+
 func TestLoadReportsMissingFile(t *testing.T) {
 	loaded, err := config.Load(filepath.Join(t.TempDir(), "missing.json"), "node-a")
 	if loaded != nil || !errors.Is(err, os.ErrNotExist) {
@@ -104,7 +124,7 @@ func TestLoadReportsMissingFile(t *testing.T) {
 }
 
 func TestLoadAcceptsTrailingWhitespace(t *testing.T) {
-	path := writeConfig(t, "{\"virtual_nodes\":8,\"members\":[{\"id\":\"node-a\",\"address\":\"http://localhost:8001\"}]}\n\t ")
+	path := writeConfig(t, "{\"replication_factor\":1,\"virtual_nodes\":8,\"members\":[{\"id\":\"node-a\",\"address\":\"http://localhost:8001\"}]}\n\t ")
 	if _, err := config.Load(path, "node-a"); err != nil {
 		t.Fatalf("Load(): %v", err)
 	}

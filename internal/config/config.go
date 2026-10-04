@@ -15,14 +15,16 @@ import (
 
 // Config contains validated membership, ownership, and the local node identity.
 type Config struct {
-	Local      cluster.Member
-	Membership *cluster.Membership
-	Ring       *consistenthash.Ring
+	Local             cluster.Member
+	Membership        *cluster.Membership
+	Ring              *consistenthash.Ring
+	ReplicationFactor int
 }
 
 type fileConfig struct {
-	Members      []cluster.Member `json:"members"`
-	VirtualNodes int              `json:"virtual_nodes"`
+	Members           []cluster.Member `json:"members"`
+	VirtualNodes      int              `json:"virtual_nodes"`
+	ReplicationFactor *int             `json:"replication_factor"`
 }
 
 // Load reads a shared JSON configuration and selects the local node by ID.
@@ -47,13 +49,18 @@ func Load(path, nodeID string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster hash ring: %w", err)
 	}
-	return &Config{Local: local, Membership: membership, Ring: ring}, nil
+	factor := document.ReplicationFactor
+	if factor == nil || *factor < 1 || *factor > len(membership.NodeIDs()) {
+		return nil, errors.New("replication_factor must be between one and the member count")
+	}
+	return &Config{Local: local, Membership: membership, Ring: ring, ReplicationFactor: *factor}, nil
 }
 
 func decodeConfig(contents []byte) (fileConfig, error) {
 	decoder := json.NewDecoder(bytes.NewReader(contents))
 	decoder.DisallowUnknownFields()
-	var document fileConfig
+	defaultFactor := 3
+	document := fileConfig{ReplicationFactor: &defaultFactor}
 	if err := decoder.Decode(&document); err != nil {
 		return fileConfig{}, fmt.Errorf("decode cluster config: %w", err)
 	}

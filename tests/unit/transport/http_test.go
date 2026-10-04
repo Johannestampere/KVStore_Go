@@ -2,6 +2,7 @@ package transport_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -12,7 +13,8 @@ import (
 	"time"
 
 	"kvstore/internal/cluster"
-	"kvstore/internal/routing"
+	"kvstore/internal/replication"
+	"kvstore/internal/storage"
 	"kvstore/internal/transport"
 )
 
@@ -24,25 +26,28 @@ func TestHTTPNodeClientGetResponses(t *testing.T) {
 		found             bool
 		err               error
 	}{
-		{"value", 200, "application/json", `{"key":"key","value":"value"}`, true, nil},
+		{"tombstone", 200, "application/json", `{"key":"key","value":"","version":{"counter":2,"node_id":"peer"},"deleted":true}`, true, nil},
+		{"invalid version", 200, "application/json", `{"key":"key","value":"value","version":{"counter":0,"node_id":"peer"},"deleted":false}`, false, replication.ErrInvalidResponse},
+		{"missing deleted", 200, "application/json", `{"key":"key","value":"value","version":{"counter":1,"node_id":"peer"}}`, false, replication.ErrInvalidResponse},
+		{"value", 200, "application/json", `{"key":"key","value":"value","version":{"counter":1,"node_id":"peer"},"deleted":false}`, true, nil},
 		{"missing", 404, "application/json", `{"error":"key not found"}`, false, nil},
-		{"generic 404", 404, "text/plain", "not found", false, routing.ErrInvalidResponse},
-		{"wrong error", 404, "application/json", `{"error":"route not found"}`, false, routing.ErrInvalidResponse},
-		{"wrong key", 200, "application/json", `{"key":"other","value":"value"}`, false, routing.ErrInvalidResponse},
-		{"missing value", 200, "application/json", `{"key":"key"}`, false, routing.ErrInvalidResponse},
-		{"null value", 200, "application/json", `{"key":"key","value":null}`, false, routing.ErrInvalidResponse},
-		{"invalid JSON", 200, "application/json", `{`, false, routing.ErrInvalidResponse},
-		{"trailing JSON", 200, "application/json", `{"key":"key","value":"value"}{}`, false, routing.ErrInvalidResponse},
-		{"wrong content type", 200, "text/plain", `{"key":"key","value":"value"}`, false, routing.ErrInvalidResponse},
-		{"unexpected status", 500, "application/json", `{}`, false, routing.ErrInvalidResponse},
-		{"unavailable", 503, "application/json", `{}`, false, routing.ErrUnavailable},
+		{"generic 404", 404, "text/plain", "not found", false, replication.ErrInvalidResponse},
+		{"wrong error", 404, "application/json", `{"error":"route not found"}`, false, replication.ErrInvalidResponse},
+		{"wrong key", 200, "application/json", `{"key":"other","value":"value"}`, false, replication.ErrInvalidResponse},
+		{"missing value", 200, "application/json", `{"key":"key"}`, false, replication.ErrInvalidResponse},
+		{"null value", 200, "application/json", `{"key":"key","value":null}`, false, replication.ErrInvalidResponse},
+		{"invalid JSON", 200, "application/json", `{`, false, replication.ErrInvalidResponse},
+		{"trailing JSON", 200, "application/json", `{"key":"key","value":"value"}{}`, false, replication.ErrInvalidResponse},
+		{"wrong content type", 200, "text/plain", `{"key":"key","value":"value","version":{"counter":1,"node_id":"peer"},"deleted":false}`, false, replication.ErrInvalidResponse},
+		{"unexpected status", 500, "application/json", `{}`, false, replication.ErrInvalidResponse},
+		{"unavailable", 503, "application/json", `{}`, false, replication.ErrUnavailable},
 		{"timeout", 504, "application/json", `{}`, false, context.DeadlineExceeded},
-		{"oversized response", 200, "application/json", strings.Repeat("x", (8<<20)+1), false, routing.ErrInvalidResponse},
+		{"oversized response", 200, "application/json", strings.Repeat("x", (8<<20)+1), false, replication.ErrInvalidResponse},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				if request.Method != http.MethodGet || request.URL.Path != "/internal/kv/key" {
+				if request.Method != http.MethodGet || request.URL.Path != "/internal/records/key" {
 					t.Errorf("unexpected peer request: %s %s", request.Method, request.URL)
 				}
 				writer.Header().Set("Content-Type", testCase.contentType)
@@ -54,12 +59,12 @@ func TestHTTPNodeClientGetResponses(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 			client := newClient(t, time.Second)
-			value, found, err := client.Get(t.Context(), cluster.Member{ID: "peer", Address: server.URL}, "key")
+			value, found, err := client.GetRecord(t.Context(), cluster.Member{ID: "peer", Address: server.URL}, "key")
 			if !errors.Is(err, testCase.err) || found != testCase.found {
-				t.Fatalf("Get = (%q, %v, %v)", value, found, err)
+				t.Fatalf("GetRecord = (%+v, %v, %v)", value, found, err)
 			}
-			if found && value != "value" {
-				t.Errorf("value = %q", value)
+			if found && !value.Deleted && value.Value != "value" {
+				t.Errorf("record = %+v", value)
 			}
 		})
 	}
@@ -80,20 +85,52 @@ func TestHTTPNodeClientRejectsMutationFailuresAndRedirects(t *testing.T) {
 		t.Cleanup(server.Close)
 		client := newClient(t, time.Second)
 		member := cluster.Member{ID: "peer", Address: server.URL}
-		if err := client.Put(t.Context(), member, "key", "value"); !errors.Is(err, routing.ErrInvalidResponse) {
+		if err := client.Apply(t.Context(), member, storage.Record{Key: "key", Value: "value", Version: storage.Version{Counter: 1, NodeID: "peer"}}); !errors.Is(err, replication.ErrInvalidResponse) {
 			t.Errorf("PUT status %d: %v", status, err)
 		}
-		if err := client.Delete(t.Context(), member, "key"); !errors.Is(err, routing.ErrInvalidResponse) {
-			t.Errorf("DELETE status %d: %v", status, err)
-		}
 		if status == 301 || status == 307 {
-			if _, _, err := client.Get(t.Context(), member, "key"); !errors.Is(err, routing.ErrInvalidResponse) {
+			if _, _, err := client.GetRecord(t.Context(), member, "key"); !errors.Is(err, replication.ErrInvalidResponse) {
 				t.Errorf("GET redirect: %v", err)
 			}
 		}
 	}
 	if redirects.Load() != 0 {
 		t.Fatal("client followed a redirect")
+	}
+}
+
+func TestHTTPNodeClientApplyPreservesRecordAndConflictErrors(t *testing.T) {
+	cases := []struct {
+		message  string
+		expected error
+	}{
+		{"record version is stale", storage.ErrStaleRecord},
+		{"conflicting record for version", storage.ErrVersionConflict},
+		{"unknown conflict", replication.ErrInvalidResponse},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.message, func(t *testing.T) {
+			record := storage.Record{Key: "key", Deleted: true, Version: storage.Version{Counter: 123, NodeID: "writer"}}
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				var received storage.Record
+				if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+					t.Error(err)
+				}
+				if received != record || request.Method != http.MethodPut || request.URL.Path != "/internal/records/key" {
+					t.Errorf("unexpected replica request: %+v", received)
+				}
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(http.StatusConflict)
+				if err := json.NewEncoder(writer).Encode(map[string]string{"error": testCase.message}); err != nil {
+					t.Error(err)
+				}
+			}))
+			t.Cleanup(server.Close)
+			err := newClient(t, time.Second).Apply(t.Context(), cluster.Member{ID: "peer", Address: server.URL}, record)
+			if !errors.Is(err, testCase.expected) {
+				t.Fatalf("Apply: %v", err)
+			}
+		})
 	}
 }
 
@@ -120,7 +157,7 @@ func TestHTTPNodeClientTimeoutAndCancellation(t *testing.T) {
 			defer cancel()
 			finished := make(chan error, 1)
 			go func() {
-				_, _, err := client.Get(ctx, cluster.Member{ID: "peer", Address: server.URL}, "key")
+				_, _, err := client.GetRecord(ctx, cluster.Member{ID: "peer", Address: server.URL}, "key")
 				finished <- err
 			}()
 			select {
@@ -159,8 +196,8 @@ func TestHTTPNodeClientTruncatedResponse(t *testing.T) {
 		}
 	}))
 	t.Cleanup(server.Close)
-	_, _, err := newClient(t, time.Second).Get(t.Context(), cluster.Member{ID: "peer", Address: server.URL}, "key")
-	if !errors.Is(err, routing.ErrInvalidResponse) {
+	_, _, err := newClient(t, time.Second).GetRecord(t.Context(), cluster.Member{ID: "peer", Address: server.URL}, "key")
+	if !errors.Is(err, replication.ErrInvalidResponse) {
 		t.Fatalf("error = %v", err)
 	}
 }

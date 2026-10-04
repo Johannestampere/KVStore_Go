@@ -200,8 +200,8 @@ func TestMemoryStoreApplyOrdering(t *testing.T) {
 		applied  bool
 		err      error
 	}{
-		{"older counter", storage.Record{Key: "key", Value: "old", Version: storage.Version{Counter: 9, NodeID: "z"}}, false, nil},
-		{"lower node ID", storage.Record{Key: "key", Value: "old", Version: storage.Version{Counter: 10, NodeID: "a"}}, false, nil},
+		{"older counter", storage.Record{Key: "key", Value: "old", Version: storage.Version{Counter: 9, NodeID: "z"}}, false, storage.ErrStaleRecord},
+		{"lower node ID", storage.Record{Key: "key", Value: "old", Version: storage.Version{Counter: 10, NodeID: "a"}}, false, storage.ErrStaleRecord},
 		{"higher node ID", storage.Record{Key: "key", Value: "winner", Version: storage.Version{Counter: 10, NodeID: "c"}}, true, nil},
 		{"newer counter", storage.Record{Key: "key", Value: "new", Version: storage.Version{Counter: 11, NodeID: "a"}}, true, nil},
 		{"identical retry", current, false, nil},
@@ -235,7 +235,7 @@ func TestMemoryStoreDeletionRejectsStaleRecordsInEitherOrder(t *testing.T) {
 	for _, records := range [][]storage.Record{{live, deleted}, {deleted, live}} {
 		store := newTestStore(t)
 		for _, record := range records {
-			if _, err := store.Apply(record); err != nil {
+			if _, err := store.Apply(record); err != nil && !errors.Is(err, storage.ErrStaleRecord) {
 				t.Fatal(err)
 			}
 		}
@@ -318,7 +318,7 @@ func TestMemoryStoreRejectsInvalidRecordsWithoutAdvancingCounter(t *testing.T) {
 func TestMemoryStoreCounterExhaustionDoesNotChangeRecords(t *testing.T) {
 	store := newTestStore(t)
 	record := storage.Record{Key: "key", Value: "last", Version: storage.Version{Counter: math.MaxUint64, NodeID: "z"}}
-	if _, err := store.Apply(record); err != nil {
+	if _, err := store.Apply(record); err != nil && !errors.Is(err, storage.ErrStaleRecord) {
 		t.Fatal(err)
 	}
 	if err := store.Put("key", "wrapped"); !errors.Is(err, storage.ErrVersionExhausted) {
@@ -361,7 +361,7 @@ func TestMemoryStoreConcurrentApplyKeepsHighestVersion(t *testing.T) {
 			defer pending.Done()
 			<-start
 			record := storage.Record{Key: "key", Value: fmt.Sprint(counter), Version: storage.Version{Counter: counter, NodeID: "remote"}}
-			if _, err := store.Apply(record); err != nil {
+			if _, err := store.Apply(record); err != nil && !errors.Is(err, storage.ErrStaleRecord) {
 				t.Error(err)
 				return
 			}
@@ -398,6 +398,37 @@ func TestMemoryStoreConcurrentLocalUpdatesHaveUniqueVersions(t *testing.T) {
 			t.Fatalf("invalid or reused version: %+v", record.Version)
 		}
 		seen[record.Version] = true
+	}
+}
+
+func TestNextVersionReservesWithoutWritingARecord(t *testing.T) {
+	store := newTestStore(t)
+	first, err := store.NextVersion(storage.Version{Counter: 100, NodeID: "remote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != (storage.Version{Counter: 101, NodeID: "node-a"}) {
+		t.Fatalf("reserved version = %+v", first)
+	}
+	if _, found := store.GetRecord(""); found {
+		t.Fatal("version reservation created a record")
+	}
+	second, err := store.NextVersion(storage.Version{Counter: 1, NodeID: "remote"})
+	if err != nil || second.Counter != 102 {
+		t.Fatalf("second version = %+v, %v", second, err)
+	}
+	if err := store.Put("key", "value"); err != nil {
+		t.Fatal(err)
+	}
+	record, found := store.GetRecord("key")
+	if !found || record.Version.Counter != 103 {
+		t.Fatalf("local write reused version: %+v", record)
+	}
+	if _, err := store.NextVersion(storage.Version{Counter: math.MaxUint64, NodeID: "remote"}); !errors.Is(err, storage.ErrVersionExhausted) {
+		t.Fatalf("overflow = %v", err)
+	}
+	if _, err := store.NextVersion(storage.Version{}); !errors.Is(err, storage.ErrVersionExhausted) {
+		t.Fatalf("counter wrapped: %v", err)
 	}
 }
 

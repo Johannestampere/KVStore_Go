@@ -1,8 +1,9 @@
 # kvstore
 
 A partitioned, in-memory key-value store with an HTTP API, written in Go using
-only the standard library. Any configured node routes a request to the key's
-owner through a shared consistent-hash ring.
+only the standard library. Any configured node coordinates requests across
+three replicas selected by a shared consistent-hash ring. Reads and writes
+currently require every selected replica to respond successfully.
 
 ```go
 store, err := storage.NewMemoryStore("node-a")
@@ -30,12 +31,12 @@ Most toy KV stores stop at a map + mutex. This one is written to be a solid foun
 
 The HTTP handler depends on a small service interface with cancellation and
 error support. The node executable connects it to local storage or cluster
-routing and manages the server's lifecycle.
+replication and manages the server's lifecycle.
 
 An immutable consistent-hash ring selects key owners, and a static membership
 directory maps node IDs to HTTP addresses. Startup can load both from a shared
-JSON file. Each key lives on exactly one owner; other nodes forward requests to
-that owner's internal HTTP endpoint.
+JSON file. Each key lives on three distinct nodes by default. The node receiving
+a public request coordinates local access and concurrent peer HTTP calls.
 
 ## Quick start
 
@@ -102,14 +103,18 @@ for example, the key `user/42` uses `/kv/user%2F42`. Handler errors use
 router's responses. GET routes also support HEAD through Go's HTTP server.
 Keys consisting of `.` or `..` must use `%2E` or `%2E%2E` to avoid path cleaning.
 
-In cluster mode, any operation can return `503` if its owner is unavailable,
-`504` if the peer request times out, or `502` for an invalid peer response.
-A missing key returns `404` only after a successful lookup on its owner.
+In cluster mode, operations can return `503` for an unavailable replica,
+`504` for a deadline, `502` for an invalid peer response, or `409` for a stale
+write or conflicting records with the same version. GET returns `404` only
+after all replicas answer and either none has a record or the highest version
+is a deletion marker. A `404` peer response counts as a successful missing-key
+lookup, not as an unavailable replica.
 
 ## Cluster startup configuration
 
 `configs/cluster.local.json` lists five local nodes on ports 8001–8005 with 64
-virtual positions per node. Start all five in separate terminals:
+virtual positions per node and `replication_factor: 3`. Start all five in
+separate terminals:
 
 ```bash
 go run ./cmd/node -config configs/cluster.local.json -id node-a -addr 127.0.0.1:8001
@@ -128,9 +133,14 @@ curl -i http://127.0.0.1:8003/kv/user:42
 curl -i -X DELETE http://127.0.0.1:8005/kv/user:42
 ```
 
-Expect `204`, `200` with Alice's value, then `204`. All three requests resolve
-to the same owner. Starting only part of the configured cluster leaves keys
-assigned to the other nodes unavailable.
+Expect `204`, `200` with Alice's value, then `204`. All three requests use the
+same replica set. After PUT, inspect local records on ports 8001–8005 with
+`GET /internal/records/user:42`: exactly three nodes hold the same record;
+the other two return `404`. After DELETE, those three nodes hold matching
+tombstones, while public GET returns `404`.
+
+Starting only part of the configured cluster leaves keys assigned to an offline
+replica unavailable under this milestone's requirement for all replicas.
 
 | Flag | Purpose | Default |
 | --- | --- | --- |
@@ -138,6 +148,7 @@ assigned to the other nodes unavailable.
 | `-config` | Shared cluster JSON file | No cluster configuration |
 | `-id` | Local member ID from that file | None |
 | `-peer-timeout` | Positive timeout for each outgoing peer request | `2s` |
+| `-request-timeout` | Deadline for a complete coordinated operation | `5s` |
 
 `-config` and `-id` must be supplied together. The local ID must exist in the
 member list. `-addr` remains independent of the advertised member address and
@@ -146,55 +157,85 @@ allows a process to bind a local interface while advertising a peer-reachable
 address. The server currently listens using plain HTTP.
 
 The configuration requires a `members` array and a positive `virtual_nodes`
-integer. Each member has `id` and `address` fields. Unknown fields, malformed JSON,
+integer. `replication_factor` defaults to 3 and must be between one and the
+member count; a smaller test cluster must set it explicitly. All nodes must
+agree on this value. `-request-timeout` must be positive and below the server's
+10-second write timeout. Each member has `id` and `address` fields. Unknown fields, malformed JSON,
 extra JSON values, invalid membership, and invalid ring settings fail startup
 before binding the listening address. The file is read once; changes require
 restarting the process. Every node must use the same topology settings.
 
 Omit both cluster flags to retain the original single-node startup behavior.
 
-## Request routing
+## Replication
 
 ```text
-Client → public /kv/{key} → Router → first owner on the hash ring
-                                      ├─ local: LocalService → MemoryStore
-                                      └─ remote: HTTPNodeClient
-                                                   ↓
-                                         /internal/kv/{key}
-                                                   ↓
-                                         LocalService → MemoryStore
+Client → public /kv/{key} → Coordinator
+                              ↓
+                    Select three distinct replicas
+                       /        |        \
+                      v         v         v
+                   Node A     Node C     Node E
+                 local store or /internal/records/{key}
 ```
 
-`Router.Put`, `Get`, and `Delete` select one owner and choose local or remote
-access. `LocalService` adapts the existing storage methods to the service
-interface. Methods receive `context.Context` (Go's cancellation/deadline
-signal) and return errors separately from missing-key results.
+The receiving node acts as the coordinator, even when it is outside the key's
+replica set. `Coordinator.Put` and `Delete` perform two phases:
 
-`HTTPNodeClient` reuses connections, propagates request cancellation, and bounds
-the complete peer exchange with `-peer-timeout`, including reading the response.
-It validates response status, JSON, and returned key, and refuses redirects.
-There are no application-level retries or fallback owners.
+1. Read every selected replica concurrently and observe the highest version.
+2. Reserve one higher version locally, then send the identical record to every
+   selected replica concurrently. DELETE sends a tombstone through the same path.
 
-Cluster mode exposes `PUT`, `GET`, and `DELETE /internal/kv/{key}` for direct
-local access. These endpoints bypass routing, preventing forwarding loops;
-they are a peer protocol, not the public client API. Standalone mode does not
-expose them. Internal request and peer response limits are 8 MiB to accommodate
-JSON escaping of values accepted under the public 1 MiB limit.
+A write returns success only after all replicas accept the record or recognize
+an identical retry. A stale record returns `409`; ignoring a stale record is
+not counted as a successful write. Concurrent coordinators can observe the
+same counter; their node IDs break the tie. One writer may receive a conflict
+if another update overtakes it.
 
-Ownership is static: an outage does not move keys, and an offline owner makes
-its keys unavailable. A timed-out write or delete may already have taken effect;
-a timeout does not imply rollback. Replication, quorums, persistence,
-and data migration are not implemented yet.
+`Coordinator.Get` reads every replica concurrently and returns the highest
+version, treating a winning tombstone as missing. Identical versions containing
+different values or deletion flags produce a conflict. Reads do not repair
+older or missing replicas yet.
+
+Replica calls run in **goroutines**, Go's lightweight concurrent tasks. Results
+arrive through a buffered **channel**, allowing workers to finish even if the
+request is canceled before their results are collected. `context.Context`
+propagates cancellation and deadlines. The operation deadline covers both
+observation and writing; the peer timeout also bounds each HTTP exchange.
+
+`HTTPNodeClient.GetRecord` and `Apply` exchange complete versioned records,
+validate responses, reuse connections, and refuse redirects. Cluster mode
+exposes `GET` and `PUT /internal/records/{key}`. These endpoints access local
+storage without forwarding or assigning a new version. Deletion is represented
+by a record with `deleted: true`, so there is no internal DELETE endpoint.
+The former `/internal/kv/{key}` protocol has been replaced.
+
+Internal JSON bodies and peer responses are limited to 8 MiB to accommodate
+escaping of public values. Incoming records require all four fields: `key`,
+`value`, `version`, and `deleted`. The value is limited to 1 MiB of decoded
+bytes, and the record key must match the URL. Missing local records return
+`404`; stored tombstones return `200` with the complete record.
+
+There are no automatic retries or fallback replicas. Membership stays fixed
+when a node fails. A failed observation phase sends no writes. A failure or
+timeout during the write phase can leave partial writes; there is no rollback,
+and subsequent reads may expose them. The system does not claim linearizability
+or automatic convergence. Restart recovery, persistence, and replica repair
+remain unfinished. Quorum reads and writes are the next milestone.
+
+Standalone mode still uses `LocalService` and exposes only the public API.
 
 ## Tests
 
 Unit tests exercise storage, HTTP behavior, consistent hashing, membership,
-configuration loading, owner selection, and the peer protocol.
+configuration loading, replica selection, and the peer protocol.
 Storage tests cover version ordering, duplicate and conflicting updates,
 deletion markers, counter exhaustion, and concurrent version assignment.
 Integration tests run real HTTP servers and storage, covering cross-node key
-lifecycles, single-owner placement, concurrent clients, escaped keys, large
-values, unavailable owners, timeouts, and internal endpoint isolation.
+lifecycles, identical three-copy placement, concurrent clients, escaped keys,
+large values, unavailable replicas, timeouts, partial writes, and internal
+endpoint isolation. Coordinator tests also cover parallel fan-out, cancellation,
+version observation, and simultaneous writers with tied counters.
 
 ```bash
 go vet ./...
@@ -212,12 +253,14 @@ Apple's Command Line Tools on macOS.
 
 ```text
 cmd/node/main.go                 Server startup and shutdown
-internal/api/handler.go          HTTP routing and validation
+internal/api/handler.go          Public HTTP validation and error responses
+internal/api/replica.go          Node-local versioned record endpoints
 internal/cluster/membership.go   Static node IDs and HTTP addresses
 internal/config/config.go        Shared JSON configuration and local identity
 internal/consistenthash/ring.go   Deterministic key ownership
 internal/routing/local.go        Local storage adapter with cancellation support
-internal/routing/router.go       Owner selection and local/remote dispatch
+internal/replication/coordinator.go  Parallel replica reads and writes
+internal/replication/record.go       Strict peer record decoding
 internal/transport/http.go       Bounded peer HTTP client
 internal/storage/memory.go       Concurrent versioned storage and logical counter
 internal/storage/record.go       Records, deletion markers, and version ordering
@@ -227,10 +270,11 @@ tests/unit/cluster/              Membership validation and lookup tests
 tests/unit/config/               Configuration loading tests
 tests/unit/consistenthash/       Hash-ring behavior and concurrency tests
 tests/unit/storage/              Storage tests
-tests/unit/routing/              Owner selection and failure tests
+tests/unit/routing/              Local service cancellation and errors
+tests/unit/replication/          Replica coordination and failure tests
 tests/unit/transport/            Peer protocol and cancellation tests
 tests/integration/api/           HTTP tests with real storage
-tests/integration/routing/       Cross-node HTTP tests
+tests/integration/replication/   Five-node replication tests
 ```
 
 ## Storage contract
@@ -241,14 +285,15 @@ tests/integration/routing/       Cross-node HTTP tests
 | `Get(key)` | `(value, true)` if present, `("", false)` if missing |
 | `Delete(key)` | Write a new deletion marker, including for absent keys; returns an error on failure |
 | `GetRecord(key)` | Return the complete record, including deletion markers, and a found flag |
-| `Apply(record)` | Atomically accept a newer record; return whether storage changed and an error |
+| `Apply(record)` | Atomically accept a newer record; reject stale/conflicting records; identical retries succeed without changes |
+| `NextVersion(observed)` | Reserve a version higher than the observed and local counters without storing a record |
 
 Empty keys and values are allowed. The `found` boolean is the only reliable way to distinguish a stored empty string from a missing key. Operations are individually synchronized; there are no multi-key transactions.
 
 Construct storage with `NewMemoryStore(nodeID)`, which validates the writer's
 identity. A zero-value store rejects local writes because it has no node ID.
 Cluster startup uses the configured ID; standalone startup uses `standalone`.
-The HTTP response format and status codes remain unchanged.
+Public successful responses retain the original format.
 
 ## Versioned records
 
@@ -262,25 +307,25 @@ The store maintains one counter across keys. A local PUT or DELETE increments
 it under the same lock that updates the record. Applying a remote record raises
 the counter to at least the received value, so the next local update follows
 every version the store has accepted. Counter overflow returns an error without
-changing storage.
+changing stored records.
 
-`Apply` ignores older records and identical retries. A different value or
+`Apply` rejects older records with `ErrStaleRecord`; identical retries succeed
+without changes. A different value or
 deletion flag with the same key and exact version returns `ErrVersionConflict`;
 one version must identify one update. Invalid records are rejected before
 storage changes. Records contain strings and value fields, so returned copies
 cannot mutate storage.
 
 DELETE retains a **tombstone**, a record with `Deleted: true` and an empty value.
-`Get` treats it as missing, while `GetRecord` exposes it for future replication.
+`Get` treats it as missing, while `GetRecord` exposes it to replication.
 An older value cannot overwrite that marker; a newer PUT can recreate the key.
 Repeated deletes create newer markers even when the key is already absent.
 Tombstones are retained indefinitely for now and consume memory.
 
-This milestone adds the storage foundation only. Peer HTTP calls still carry
-plain values; the selected owner assigns their versions. The next replication
-milestone must assign one version per update and send that same record to each
-replica. It must also observe replica versions before generating updates where
-needed. An independent counter alone cannot reveal unseen writes on other nodes.
+The coordinator uses `NextVersion` to reserve a version without storing an
+extra copy on a node outside the replica set. Reservations and local writes
+share the same locked counter. Failed operations can leave gaps in that counter;
+gaps are harmless. Every replica receives the reserved version unchanged.
 
 Records and counters are currently in memory. Restarting a node loses both and
 can reuse versions under the same node ID. Before supporting replication across
@@ -338,4 +383,4 @@ directory; concurrent reads need no locks.
 Validation checks configuration syntax without DNS lookups or network requests.
 It does not verify reachability or whether different addresses refer to the same
 server. Offline nodes remain members. Startup loads the directory, identifies
-the local node, and connects the shared topology to request routing.
+the local node, and connects the shared topology to replication.
