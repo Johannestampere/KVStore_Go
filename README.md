@@ -1,9 +1,10 @@
 # kvstore
 
-A partitioned, in-memory key-value store with an HTTP API, written in Go using
+A partitioned key-value store with optional append-only persistence and an HTTP
+API, written in Go using
 only the standard library. Any configured node coordinates requests across
 three replicas selected by a shared consistent-hash ring. Reads and writes
-currently require every selected replica to respond successfully.
+use configurable quorums: by default, two successful responses out of three.
 
 ```go
 store, err := storage.NewMemoryStore("node-a")
@@ -40,18 +41,19 @@ a public request coordinates local access and concurrent peer HTTP calls.
 
 ## Quick start
 
-Requires Go 1.27.0 or newer, matching `go.mod`.
+Requires Go 1.27.0 or newer, matching `go.mod`. Persistent storage currently
+targets macOS and Linux local filesystems.
 
 Start the server:
 
 ```bash
-go run ./cmd/node
+go run ./cmd/node -data-dir data/standalone
 ```
 
 The default address is `127.0.0.1:8001`. To use another address:
 
 ```bash
-go run ./cmd/node -addr 127.0.0.1:8002
+go run ./cmd/node -addr 127.0.0.1:8002 -data-dir data/standalone-8002
 ```
 
 Run these commands in a second terminal:
@@ -78,7 +80,9 @@ go build -o /tmp/kvstore-node ./cmd/node
 ```
 
 Ctrl+C or SIGTERM stops new connections and allows active requests up to ten
-seconds to finish, then closes remaining connections. The server uses a
+seconds to finish, then closes remaining connections. Shutdown then drains
+outstanding replica calls for up to ten seconds, canceling them if that budget
+expires. The server uses a
 five-second header timeout, ten-second read/write timeouts, and a sixty-second
 idle timeout. Startup and shutdown failures exit with a nonzero status.
 
@@ -103,25 +107,26 @@ for example, the key `user/42` uses `/kv/user%2F42`. Handler errors use
 router's responses. GET routes also support HEAD through Go's HTTP server.
 Keys consisting of `.` or `..` must use `%2E` or `%2E%2E` to avoid path cleaning.
 
-In cluster mode, operations can return `503` for an unavailable replica,
+In cluster mode, operations can return `503` when too few replicas are available,
 `504` for a deadline, `502` for an invalid peer response, or `409` for a stale
 write or conflicting records with the same version. GET returns `404` only
-after all replicas answer and either none has a record or the highest version
-is a deletion marker. A `404` peer response counts as a successful missing-key
+after a read quorum answers and either none of those responses has a record or
+the highest returned version is a deletion marker. A `404` peer response counts as a successful missing-key
 lookup, not as an unavailable replica.
 
 ## Cluster startup configuration
 
 `configs/cluster.local.json` lists five local nodes on ports 8001–8005 with 64
-virtual positions per node and `replication_factor: 3`. Start all five in
+virtual positions per node, `replication_factor: 3`, `read_quorum: 2`, and
+`write_quorum: 2`. Start all five in
 separate terminals:
 
 ```bash
-go run ./cmd/node -config configs/cluster.local.json -id node-a -addr 127.0.0.1:8001
-go run ./cmd/node -config configs/cluster.local.json -id node-b -addr 127.0.0.1:8002
-go run ./cmd/node -config configs/cluster.local.json -id node-c -addr 127.0.0.1:8003
-go run ./cmd/node -config configs/cluster.local.json -id node-d -addr 127.0.0.1:8004
-go run ./cmd/node -config configs/cluster.local.json -id node-e -addr 127.0.0.1:8005
+go run ./cmd/node -config configs/cluster.local.json -id node-a -addr 127.0.0.1:8001 -data-dir data/node-a
+go run ./cmd/node -config configs/cluster.local.json -id node-b -addr 127.0.0.1:8002 -data-dir data/node-b
+go run ./cmd/node -config configs/cluster.local.json -id node-c -addr 127.0.0.1:8003 -data-dir data/node-c
+go run ./cmd/node -config configs/cluster.local.json -id node-d -addr 127.0.0.1:8004 -data-dir data/node-d
+go run ./cmd/node -config configs/cluster.local.json -id node-e -addr 127.0.0.1:8005 -data-dir data/node-e
 ```
 
 Write through one node and read or delete through another:
@@ -135,18 +140,21 @@ curl -i -X DELETE http://127.0.0.1:8005/kv/user:42
 
 Expect `204`, `200` with Alice's value, then `204`. All three requests use the
 same replica set. After PUT, inspect local records on ports 8001–8005 with
-`GET /internal/records/user:42`: exactly three nodes hold the same record;
-the other two return `404`. After DELETE, those three nodes hold matching
-tombstones, while public GET returns `404`.
+`GET /internal/records/user:42`: the three selected nodes should hold the same
+record once outstanding writes finish; the other two return `404`. A successful
+PUT guarantees at least two acknowledgements. After DELETE, acknowledged
+replicas hold a tombstone, while public GET returns `404`.
 
-Starting only part of the configured cluster leaves keys assigned to an offline
-replica unavailable under this milestone's requirement for all replicas.
+With the default quorums, one unavailable replica does not prevent reads or
+writes. Two unavailable replicas for the same key prevent quorum. Ownership
+does not change when a node is offline.
 
 | Flag | Purpose | Default |
 | --- | --- | --- |
 | `-addr` | Local listening address | `127.0.0.1:8001` |
 | `-config` | Shared cluster JSON file | No cluster configuration |
 | `-id` | Local member ID from that file | None |
+| `-data-dir` | Exclusive node-local log directory | Empty: memory only |
 | `-peer-timeout` | Positive timeout for each outgoing peer request | `2s` |
 | `-request-timeout` | Deadline for a complete coordinated operation | `5s` |
 
@@ -159,13 +167,20 @@ address. The server currently listens using plain HTTP.
 The configuration requires a `members` array and a positive `virtual_nodes`
 integer. `replication_factor` defaults to 3 and must be between one and the
 member count; a smaller test cluster must set it explicitly. All nodes must
-agree on this value. `-request-timeout` must be positive and below the server's
+agree on placement and quorum settings. `read_quorum` and `write_quorum` each
+default to a majority (`replication_factor / 2 + 1`). Both must be between 1
+and the replication factor, and their sum must exceed the replication factor.
+Explicit zero, null, and non-overlapping settings are rejected. Set both to the
+replication factor to require every replica.
+
+`-request-timeout` must be positive and below the server's
 10-second write timeout. Each member has `id` and `address` fields. Unknown fields, malformed JSON,
 extra JSON values, invalid membership, and invalid ring settings fail startup
 before binding the listening address. The file is read once; changes require
 restarting the process. Every node must use the same topology settings.
 
-Omit both cluster flags to retain the original single-node startup behavior.
+Omit both cluster flags for standalone mode. Supply `-data-dir` in either mode
+to preserve local data across restarts; omitting it keeps the in-memory behavior.
 
 ## Replication
 
@@ -182,26 +197,42 @@ Client → public /kv/{key} → Coordinator
 The receiving node acts as the coordinator, even when it is outside the key's
 replica set. `Coordinator.Put` and `Delete` perform two phases:
 
-1. Read every selected replica concurrently and observe the highest version.
-2. Reserve one higher version locally, then send the identical record to every
-   selected replica concurrently. DELETE sends a tombstone through the same path.
+1. Contact all selected replicas concurrently, wait for `read_quorum` valid
+   responses, and observe the highest version among them.
+2. Reserve one higher version locally, then attempt the identical record on
+   every selected replica concurrently. Return after `write_quorum` accepts it.
+   DELETE sends a tombstone through the same path.
 
-A write returns success only after all replicas accept the record or recognize
-an identical retry. A stale record returns `409`; ignoring a stale record is
-not counted as a successful write. Concurrent coordinators can observe the
+A replica acknowledgement means the record was accepted or recognized as an
+identical retry. With `-data-dir`, new records are synchronized to disk before
+acknowledgement. Stale or conflicting records do not count toward quorum; an
+operation that cannot obtain enough acknowledgements can return `409` when
+version conflicts are the cause. Concurrent coordinators can observe the
 same counter; their node IDs break the tie. One writer may receive a conflict
 if another update overtakes it.
 
-`Coordinator.Get` reads every replica concurrently and returns the highest
-version, treating a winning tombstone as missing. Identical versions containing
-different values or deletion flags produce a conflict. Reads do not repair
-older or missing replicas yet.
+`Coordinator.Get` contacts every replica and returns the highest version among
+the first `read_quorum` valid responses, treating a winning tombstone as missing.
+A valid missing-key response counts toward quorum; malformed responses and
+network errors do not. Conflicting contents with the same version among the
+selected responses produce a conflict. Remaining reads are canceled after
+quorum succeeds or becomes impossible. Reads do not repair older or missing
+replicas yet.
 
 Replica calls run in **goroutines**, Go's lightweight concurrent tasks. Results
 arrive through a buffered **channel**, allowing workers to finish even if the
 request is canceled before their results are collected. `context.Context`
 propagates cancellation and deadlines. The operation deadline covers both
 observation and writing; the peer timeout also bounds each HTTP exchange.
+Quorum collection stops as soon as enough successes arrive or the remaining
+responses cannot make success possible.
+
+After write quorum succeeds, outstanding writes continue even after the client
+request ends. They keep the original operation deadline; there is no timeout
+extension. Before quorum succeeds, caller cancellation or quorum failure cancels
+outstanding writes. Background failures are logged. `Coordinator.Shutdown`
+stops admission and drains active requests and replica calls; an expired shutdown
+deadline cancels remaining work.
 
 `HTTPNodeClient.GetRecord` and `Apply` exchange complete versioned records,
 validate responses, reuse connections, and refuse redirects. Cluster mode
@@ -220,10 +251,100 @@ There are no automatic retries or fallback replicas. Membership stays fixed
 when a node fails. A failed observation phase sends no writes. A failure or
 timeout during the write phase can leave partial writes; there is no rollback,
 and subsequent reads may expose them. The system does not claim linearizability
-or automatic convergence. Restart recovery, persistence, and replica repair
-remain unfinished. Quorum reads and writes are the next milestone.
+or automatic convergence. Persistence recovers each node's own log; replica
+repair remains unfinished. Quorum overlap (`R + W > N`) applies within the unchanged
+replica set; it is not a proof of strong consistency. A newer partial write can
+be visible to one read quorum and absent from another. Version observation uses
+only its responding quorum, so an unobserved newer version can also reject a
+subsequent write on a replica. Failed or canceled writes may still have effects.
 
 Standalone mode still uses `LocalService` and exposes only the public API.
+
+## One-node failure demo
+
+Start all five nodes using the sample configuration, then write a demo key:
+
+```bash
+curl -i -X PUT http://127.0.0.1:8001/kv/demo:quorum \
+  -H 'Content-Type: application/json' -d '{"value":"before failure"}'
+
+for port in 8001 8002 8003 8004 8005; do
+  curl -i "http://127.0.0.1:${port}/internal/records/demo:quorum"
+done
+```
+
+Choose one node returning a record and stop it with Ctrl+C in its terminal.
+Keep the configuration unchanged. Run these commands against any remaining
+node, substituting its listening port if needed:
+
+```bash
+curl -i http://127.0.0.1:8002/kv/demo:quorum
+curl -i -X PUT http://127.0.0.1:8002/kv/demo:quorum \
+  -H 'Content-Type: application/json' -d '{"value":"during failure"}'
+curl -i http://127.0.0.1:8002/kv/demo:quorum
+curl -i -X DELETE http://127.0.0.1:8002/kv/demo:quorum
+curl -i http://127.0.0.1:8002/kv/demo:quorum
+```
+
+Expect `200`, `204`, `200` with the updated value, `204`, and `404`.
+Stopping a second node in that key's replica set makes requests fail with `503`
+when connection failures are detected, or `504` if requests time out. Restarting
+a node with the same `-data-dir` restores its synchronized local history,
+including tombstones. It does not repair updates missed while offline.
+
+## Persistence and recovery
+
+`-data-dir` enables `PersistentStore`; each node must use its own directory and
+retain it across restarts. The log records the node identity and rejects a
+mismatched `-id`. An advisory file lock prevents two processes from opening the
+same log for writing. The lock is released when the process exits, including a
+crash. The sample directories under `data/` are excluded from Git.
+
+A single writer goroutine serializes mutations through a channel. It appends a
+log entry, calls `File.Sync`, then publishes the change to the in-memory map.
+Reads use a short memory lock and continue while disk I/O is pending. PUT,
+DELETE, and incoming replica updates follow this ordering. Identical retries
+need no new entry; stale or conflicting updates are rejected.
+
+`NextVersion` also synchronizes reservations before returning. This preserves
+the coordinator's counter even when it is outside the replica set and stores
+no copy of the value. Replay restores both the records and the highest reserved
+counter. A failed operation may leave counter gaps, which are harmless.
+
+`store.log` starts with format and node-identity metadata. Each frame has a
+12-byte header containing a payload length, payload CRC32, and header CRC32.
+Payloads use Go's binary `gob` encoding, preserving string bytes exactly, and
+are limited to 16 MiB. A damaged length fails the header checksum before it can
+be mistaken for an incomplete final entry.
+
+Startup replays the log before accepting HTTP requests. A partial final header
+or payload is truncated to the last complete frame, and the truncation is
+synchronized before new writes. Complete frames with invalid checksums, metadata,
+or record/counter ordering fail startup instead of silently discarding data.
+
+After an append or synchronization error, mutations fail until the store is
+reopened. The failed entry is not published in memory, but may survive recovery;
+a failed response never proves that a write had no effect. Reads still expose
+the last successfully published state. The `Journal` interface isolates this
+storage boundary so tests can simulate failures and delayed synchronization.
+
+Shutdown drains HTTP requests and replication before closing storage. If the
+replication drain times out, it cancels outstanding work and closes storage to
+new mutations. An already admitted disk operation completes before close.
+Filesystem writes and synchronization are not context-cancellable, so stalled
+local disk I/O can outlast HTTP and shutdown deadlines.
+
+To verify standalone recovery, start the quick-start command, write a key,
+stop the process, then restart with the same directory and GET the key again.
+The integration tests also verify acknowledged values after forcibly killing
+the executable, and ensure deleted values remain deleted.
+
+There is no log compaction, snapshotting, or replica repair yet. All current
+records and tombstones remain in memory; historical entries remain on disk and
+increase startup replay work. `File.Sync` requests OS-level synchronization;
+power-loss behavior still depends on the filesystem and device. This project
+does not claim production-grade power-loss durability. Removing the data
+directory loses both records and the version history for that node identity.
 
 ## Tests
 
@@ -235,7 +356,14 @@ Integration tests run real HTTP servers and storage, covering cross-node key
 lifecycles, identical three-copy placement, concurrent clients, escaped keys,
 large values, unavailable replicas, timeouts, partial writes, and internal
 endpoint isolation. Coordinator tests also cover parallel fan-out, cancellation,
-version observation, and simultaneous writers with tied counters.
+version observation, and simultaneous writers with tied counters. Quorum tests
+exercise one-node availability, impossible quorums, invalid responses, missing
+keys, post-response replication, caller cancellation, original deadlines, and
+shutdown draining. Tests also retain the stricter three-of-three policy.
+Persistence tests cover replay, tombstones, unstored version reservations,
+concurrent mutations, uncertain disk errors, incomplete tails, corruption,
+exclusive access, identity checks, and graceful/crash restarts of the compiled
+node in standalone and single-member cluster modes.
 
 ```bash
 go vet ./...
@@ -261,9 +389,14 @@ internal/consistenthash/ring.go   Deterministic key ownership
 internal/routing/local.go        Local storage adapter with cancellation support
 internal/replication/coordinator.go  Parallel replica reads and writes
 internal/replication/record.go       Strict peer record decoding
+internal/replication/quorum.go       Quorum validation and result collection
+internal/replication/lifecycle.go    Cancellation and graceful draining
 internal/transport/http.go       Bounded peer HTTP client
 internal/storage/memory.go       Concurrent versioned storage and logical counter
 internal/storage/record.go       Records, deletion markers, and version ordering
+internal/storage/persistent.go   Serialized durable mutations and memory reads
+internal/storage/journal.go      Durable entry and journal contract
+internal/storage/log.go          Framing, checksums, exclusive locking, and replay
 configs/cluster.local.json       Five-node local topology
 tests/unit/api/                  Handler tests with a service spy
 tests/unit/cluster/              Membership validation and lookup tests
@@ -275,6 +408,7 @@ tests/unit/replication/          Replica coordination and failure tests
 tests/unit/transport/            Peer protocol and cancellation tests
 tests/integration/api/           HTTP tests with real storage
 tests/integration/replication/   Five-node replication tests
+tests/integration/storage/       Log recovery and executable restart tests
 ```
 
 ## Storage contract
@@ -290,8 +424,8 @@ tests/integration/replication/   Five-node replication tests
 
 Empty keys and values are allowed. The `found` boolean is the only reliable way to distinguish a stored empty string from a missing key. Operations are individually synchronized; there are no multi-key transactions.
 
-Construct storage with `NewMemoryStore(nodeID)`, which validates the writer's
-identity. A zero-value store rejects local writes because it has no node ID.
+Construct volatile storage with `NewMemoryStore(nodeID)` or durable storage
+with `OpenPersistentStore(directory, nodeID)`. Both validate the writer's identity. A zero-value store rejects local writes because it has no node ID.
 Cluster startup uses the configured ID; standalone startup uses `standalone`.
 Public successful responses retain the original format.
 
@@ -303,8 +437,9 @@ order. For example, `(8, node-a)` follows `(7, node-z)`, and `(8, node-b)` wins 
 tie with `(8, node-a)`. These rules give all replicas the same comparison result;
 they do not measure wall-clock time or establish strong consistency.
 
-The store maintains one counter across keys. A local PUT or DELETE increments
-it under the same lock that updates the record. Applying a remote record raises
+The store maintains one counter across keys. A local PUT or DELETE advances
+it together with the record: under a lock in `MemoryStore`, or through the
+serialized journal writer in `PersistentStore`. Applying a remote record raises
 the counter to at least the received value, so the next local update follows
 every version the store has accepted. Counter overflow returns an error without
 changing stored records.
@@ -324,13 +459,13 @@ Tombstones are retained indefinitely for now and consume memory.
 
 The coordinator uses `NextVersion` to reserve a version without storing an
 extra copy on a node outside the replica set. Reservations and local writes
-share the same locked counter. Failed operations can leave gaps in that counter;
+share the same serialized counter. Failed operations can leave gaps in that counter;
 gaps are harmless. Every replica receives the reserved version unchanged.
 
-Records and counters are currently in memory. Restarting a node loses both and
-can reuse versions under the same node ID. Before supporting replication across
-restarts, recovery must restore the counter and records or introduce a durable
-writer epoch. There is no replica repair or convergence mechanism yet.
+With `-data-dir`, restart recovery restores records, tombstones, and reserved
+counters before serving requests. Memory-only mode loses those on restart and
+can reuse versions under the same node ID; use persistent directories for
+restart experiments. There is no replica repair or convergence mechanism yet.
 
 ## Consistent hashing
 

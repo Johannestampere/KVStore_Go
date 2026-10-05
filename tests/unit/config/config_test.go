@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -35,6 +36,9 @@ func TestLoadSelectsLocalMember(t *testing.T) {
 		}
 		if loaded.ReplicationFactor != 3 {
 			t.Errorf("default replication factor = %d", loaded.ReplicationFactor)
+		}
+		if loaded.ReadQuorum != 2 || loaded.WriteQuorum != 2 {
+			t.Errorf("default quorums = %d/%d", loaded.ReadQuorum, loaded.WriteQuorum)
 		}
 		if ids := loaded.Membership.NodeIDs(); !slices.Equal(ids, expectedIDs) {
 			t.Errorf("membership IDs = %v, want %v", ids, expectedIDs)
@@ -113,6 +117,46 @@ func TestLoadValidatesReplicationFactor(t *testing.T) {
 	}
 	if loaded.ReplicationFactor != 1 {
 		t.Fatalf("explicit factor = %d", loaded.ReplicationFactor)
+	}
+	if loaded.ReadQuorum != 1 || loaded.WriteQuorum != 1 {
+		t.Errorf("single-replica defaults = %d/%d", loaded.ReadQuorum, loaded.WriteQuorum)
+	}
+}
+
+func TestLoadValidatesQuorums(t *testing.T) {
+	const members = `[{"id":"a","address":"http://a:8001"},{"id":"b","address":"http://b:8001"},{"id":"c","address":"http://c:8001"}]`
+	cases := []struct {
+		fields        string
+		valid         bool
+		reads, writes int
+	}{
+		{`"read_quorum":2,"write_quorum":2`, true, 2, 2},
+		{`"read_quorum":1,"write_quorum":3`, true, 1, 3},
+		{`"read_quorum":3,"write_quorum":1`, true, 3, 1},
+		{`"read_quorum":3,"write_quorum":3`, true, 3, 3},
+		{`"read_quorum":1,"write_quorum":2`, false, 0, 0},
+		{`"read_quorum":0`, false, 0, 0},
+		{`"write_quorum":0`, false, 0, 0},
+		{`"read_quorum":4`, false, 0, 0},
+		{`"write_quorum":4`, false, 0, 0},
+		{`"read_quorum":-1`, false, 0, 0},
+		{`"write_quorum":-1`, false, 0, 0},
+		{`"read_quorum":null`, false, 0, 0},
+		{`"write_quorum":null`, false, 0, 0},
+		{`"read_quorum":1.5`, false, 0, 0},
+		{`"write_quorum":"2"`, false, 0, 0},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.fields, func(t *testing.T) {
+			body := fmt.Sprintf(`{"virtual_nodes":8,"members":%s,%s}`, members, testCase.fields)
+			loaded, err := config.Load(writeConfig(t, body), "a")
+			if (err == nil) != testCase.valid {
+				t.Fatalf("Load: %v", err)
+			}
+			if testCase.valid && (loaded.ReadQuorum != testCase.reads || loaded.WriteQuorum != testCase.writes) {
+				t.Fatalf("quorums: %d/%d", loaded.ReadQuorum, loaded.WriteQuorum)
+			}
+		})
 	}
 }
 

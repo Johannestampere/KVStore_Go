@@ -25,6 +25,7 @@ type nodeOptions struct {
 	address        string
 	configPath     string
 	nodeID         string
+	dataDirectory  string
 	peerTimeout    time.Duration
 	requestTimeout time.Duration
 }
@@ -36,7 +37,7 @@ func main() {
 	}
 }
 
-func run(arguments []string) error {
+func run(arguments []string) (runError error) {
 	options, err := parseOptions(arguments)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -49,10 +50,20 @@ func run(arguments []string) error {
 		return err
 	}
 	defer peerClient.CloseIdleConnections()
-	handler, err := buildHandler(options, peerClient)
+	handler, drain, err := buildHandler(options, peerClient)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := drain(ctx); err != nil {
+			runError = errors.Join(runError, fmt.Errorf("close node services: %w", err))
+		}
+		if runError == nil {
+			slog.Info("node stopped")
+		}
+	}()
 
 	shutdownSignal, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -88,40 +99,74 @@ func run(arguments []string) error {
 	if err := <-serveErrors; !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("serve HTTP: %w", err)
 	}
-	slog.Info("node stopped")
 	return nil
 }
 
-func buildHandler(options nodeOptions, peerClient replication.ReplicaClient) (http.Handler, error) {
+func buildHandler(options nodeOptions, peerClient replication.ReplicaClient) (http.Handler, func(context.Context) error, error) {
+	var topology *config.Config
+	if options.configPath != "" {
+		var err error
+		topology, err = config.Load(options.configPath, options.nodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	store, closeStore, err := openStorage(options)
+	if err != nil {
+		return nil, nil, err
+	}
+	if topology == nil {
+		return api.NewHandler(routing.NewLocalService(store)), func(context.Context) error { return closeStore() }, nil
+	}
+	handler, drain, err := buildClusterHandler(topology, options, peerClient, store)
+	if err != nil {
+		return nil, nil, errors.Join(err, closeStore())
+	}
+	return handler, func(ctx context.Context) error {
+		drainError := drain(ctx)
+		return errors.Join(drainError, closeStore())
+	}, nil
+}
+
+type nodeStore interface {
+	routing.Store
+	replication.Store
+}
+
+func openStorage(options nodeOptions) (nodeStore, func() error, error) {
 	nodeID := options.nodeID
 	if nodeID == "" {
 		nodeID = "standalone"
 	}
+	if options.dataDirectory != "" {
+		store, err := storage.OpenPersistentStore(options.dataDirectory, nodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+		slog.Info("persistent storage restored", "node_id", nodeID, "directory", options.dataDirectory)
+		return store, store.Close, nil
+	}
 	store, err := storage.NewMemoryStore(nodeID)
-	if err != nil {
-		return nil, err
-	}
-	if options.configPath == "" {
-		return api.NewHandler(routing.NewLocalService(store)), nil
-	}
-	topology, err := config.Load(options.configPath, options.nodeID)
-	if err != nil {
-		return nil, err
-	}
+	return store, func() error { return nil }, err
+}
+
+func buildClusterHandler(topology *config.Config, options nodeOptions, peerClient replication.ReplicaClient, store nodeStore) (http.Handler, func(context.Context) error, error) {
 	coordinator, err := replication.NewCoordinator(replication.Options{
 		LocalID: topology.Local.ID, Store: store, Membership: topology.Membership,
 		Ring: topology.Ring, Client: peerClient,
 		ReplicationFactor: topology.ReplicationFactor, Timeout: options.requestTimeout,
+		ReadQuorum: topology.ReadQuorum, WriteQuorum: topology.WriteQuorum,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("configure replication: %w", err)
+		return nil, nil, fmt.Errorf("configure replication: %w", err)
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/internal/", api.NewReplicaHandler(store))
 	mux.Handle("/", api.NewHandler(coordinator))
 	slog.Info("cluster replication configured", "node_id", topology.Local.ID,
-		"advertised_address", topology.Local.Address, "members", len(topology.Membership.NodeIDs()), "replicas", topology.ReplicationFactor)
-	return mux, nil
+		"advertised_address", topology.Local.Address, "members", len(topology.Membership.NodeIDs()),
+		"replicas", topology.ReplicationFactor, "read_quorum", topology.ReadQuorum, "write_quorum", topology.WriteQuorum)
+	return mux, coordinator.Shutdown, nil
 }
 
 func parseOptions(arguments []string) (nodeOptions, error) {
@@ -130,6 +175,7 @@ func parseOptions(arguments []string) (nodeOptions, error) {
 	flags.StringVar(&options.address, "addr", "127.0.0.1:8001", "HTTP listen address (host:port)")
 	flags.StringVar(&options.configPath, "config", "", "shared cluster JSON file")
 	flags.StringVar(&options.nodeID, "id", "", "local node ID from the cluster configuration")
+	flags.StringVar(&options.dataDirectory, "data-dir", "", "node-local log directory (empty uses memory only)")
 	flags.DurationVar(&options.peerTimeout, "peer-timeout", 2*time.Second, "maximum duration of a peer request")
 	flags.DurationVar(&options.requestTimeout, "request-timeout", 5*time.Second, "maximum duration of a coordinated operation (below 10s)")
 	if err := flags.Parse(arguments); err != nil {

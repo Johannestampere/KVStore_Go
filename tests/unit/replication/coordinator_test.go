@@ -42,6 +42,7 @@ func TestCoordinatorPlacesIdenticalRecordsOnDistinctReplicas(t *testing.T) {
 		t.Run(fmt.Sprint(factor), func(t *testing.T) {
 			options, client := newOptions(t)
 			options.ReplicationFactor = factor
+			options.ReadQuorum, options.WriteQuorum = factor, factor
 			coordinator := newCoordinator(t, options)
 			for _, key := range []string{"key", "other", ""} {
 				if err := coordinator.Put(t.Context(), key, ""); err != nil {
@@ -221,11 +222,20 @@ func TestCoordinatorReportsPartialWriteWithoutRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	accepted := make(chan struct{}, 2)
 	client.write = func(ctx context.Context, member cluster.Member, record storage.Record) error {
 		if member.ID == owners[0] {
+			for range 2 {
+				select {
+				case <-accepted:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 			return replication.ErrUnavailable
 		}
 		_, err := client.stores[member.ID].Apply(record)
+		accepted <- struct{}{}
 		return err
 	}
 	if err := newCoordinator(t, options).Put(t.Context(), key, "value"); !errors.Is(err, replication.ErrUnavailable) {
@@ -415,7 +425,12 @@ func TestCoordinatorDeadlineBoundsTheWholeOperation(t *testing.T) {
 
 func TestNewCoordinatorRejectsInvalidOptions(t *testing.T) {
 	cases := map[string]func(*replication.Options){
-		"store": func(o *replication.Options) { o.Store = nil }, "client": func(o *replication.Options) { o.Client = nil },
+		"read quorum zero":       func(o *replication.Options) { o.ReadQuorum = 0 },
+		"write quorum zero":      func(o *replication.Options) { o.WriteQuorum = 0 },
+		"read quorum too large":  func(o *replication.Options) { o.ReadQuorum = 4 },
+		"write quorum too large": func(o *replication.Options) { o.WriteQuorum = 4 },
+		"no quorum overlap":      func(o *replication.Options) { o.ReadQuorum = 1; o.WriteQuorum = 2 },
+		"store":                  func(o *replication.Options) { o.Store = nil }, "client": func(o *replication.Options) { o.Client = nil },
 		"membership": func(o *replication.Options) { o.Membership = nil }, "ring": func(o *replication.Options) { o.Ring = nil },
 		"local ID": func(o *replication.Options) { o.LocalID = "unknown" }, "zero replicas": func(o *replication.Options) { o.ReplicationFactor = 0 },
 		"too many replicas": func(o *replication.Options) { o.ReplicationFactor = 6 }, "timeout": func(o *replication.Options) { o.Timeout = 0 },
@@ -451,7 +466,7 @@ func newOptions(t *testing.T) (replication.Options, *replicaClient) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return replication.Options{LocalID: "e", Store: client.stores["e"], Client: client, Membership: membership, Ring: ring, ReplicationFactor: 3, Timeout: 5 * time.Second}, client
+	return replication.Options{LocalID: "e", Store: client.stores["e"], Client: client, Membership: membership, Ring: ring, ReplicationFactor: 3, ReadQuorum: 3, WriteQuorum: 3, Timeout: 5 * time.Second}, client
 }
 
 func newCoordinator(t *testing.T, options replication.Options) *replication.Coordinator {
@@ -460,6 +475,13 @@ func newCoordinator(t *testing.T, options replication.Options) *replication.Coor
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := coordinator.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown coordinator: %v", err)
+		}
+	})
 	return coordinator
 }
 

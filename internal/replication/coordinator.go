@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"kvstore/internal/cluster"
@@ -39,10 +41,12 @@ type Options struct {
 	Ring              *consistenthash.Ring
 	Client            ReplicaClient
 	ReplicationFactor int
+	ReadQuorum        int
+	WriteQuorum       int
 	Timeout           time.Duration
 }
 
-// Coordinator requires every selected replica for reads and writes.
+// Coordinator reads and writes a fixed replica set using overlapping quorums.
 type Coordinator struct {
 	localID           string
 	store             Store
@@ -50,7 +54,15 @@ type Coordinator struct {
 	ring              *consistenthash.Ring
 	client            ReplicaClient
 	replicationFactor int
+	readQuorum        int
+	writeQuorum       int
 	timeout           time.Duration
+	mu                sync.Mutex
+	closing           bool
+	pending           sync.WaitGroup
+	lifetime          context.Context
+	stop              context.CancelFunc
+	drained           chan struct{}
 }
 
 // NewCoordinator validates placement and dependencies before serving requests.
@@ -60,6 +72,9 @@ func NewCoordinator(options Options) (*Coordinator, error) {
 	}
 	if options.Timeout <= 0 {
 		return nil, errors.New("replication timeout must be positive")
+	}
+	if err := ValidateQuorums(options.ReplicationFactor, options.ReadQuorum, options.WriteQuorum); err != nil {
+		return nil, err
 	}
 	if _, found := options.Membership.Lookup(options.LocalID); !found {
 		return nil, fmt.Errorf("local node %q is not a member", options.LocalID)
@@ -80,10 +95,13 @@ func NewCoordinator(options Options) (*Coordinator, error) {
 			return nil, fmt.Errorf("ring node %q is not a member", id)
 		}
 	}
+	lifetime, stop := context.WithCancel(context.Background())
 	return &Coordinator{
 		localID: options.LocalID, store: options.Store,
 		membership: options.Membership, ring: options.Ring, client: options.Client,
 		replicationFactor: options.ReplicationFactor, timeout: options.Timeout,
+		readQuorum: options.ReadQuorum, writeQuorum: options.WriteQuorum,
+		lifetime: lifetime, stop: stop, drained: make(chan struct{}),
 	}, nil
 }
 
@@ -97,10 +115,13 @@ func (coordinator *Coordinator) Delete(ctx context.Context, key string) error {
 	return coordinator.write(ctx, storage.Record{Key: key, Deleted: true})
 }
 
-// Get returns the highest version observed after every replica responds.
+// Get returns the highest version among the first read quorum of valid responses.
 func (coordinator *Coordinator) Get(ctx context.Context, key string) (string, bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, coordinator.timeout)
-	defer cancel()
+	ctx, finish, err := coordinator.begin(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer finish()
 	replicas, err := coordinator.replicas(key)
 	if err != nil {
 		return "", false, err
@@ -113,8 +134,11 @@ func (coordinator *Coordinator) Get(ctx context.Context, key string) (string, bo
 }
 
 func (coordinator *Coordinator) write(ctx context.Context, record storage.Record) error {
-	ctx, cancel := context.WithTimeout(ctx, coordinator.timeout)
-	defer cancel()
+	ctx, finish, err := coordinator.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	replicas, err := coordinator.replicas(record.Key)
 	if err != nil {
 		return err
@@ -130,16 +154,27 @@ func (coordinator *Coordinator) write(ctx context.Context, record storage.Record
 	if err != nil {
 		return err
 	}
-	_, err = collect(ctx, replicas, func(ctx context.Context, member cluster.Member) (struct{}, error) {
+	writeContext, cancelWrites := coordinator.writeContext(ctx)
+	coordinator.pending.Add(1)
+	results := startCalls(writeContext, replicas, func(ctx context.Context, member cluster.Member) (struct{}, error) {
 		if err := ctx.Err(); err != nil {
 			return struct{}{}, err
 		}
+		var err error
 		if member.ID == coordinator.localID {
-			_, err := coordinator.store.Apply(record)
-			return struct{}{}, err
+			_, err = coordinator.store.Apply(record)
+		} else {
+			err = coordinator.client.Apply(ctx, member, record)
 		}
-		return struct{}{}, coordinator.client.Apply(ctx, member, record)
-	})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("replica write failed", "node_id", member.ID, "key", record.Key, "error", err)
+		}
+		return struct{}{}, err
+	}, func() { cancelWrites(); coordinator.pending.Done() })
+	_, err = awaitQuorum(ctx, results, len(replicas), coordinator.writeQuorum)
+	if err != nil {
+		cancelWrites()
+	}
 	return err
 }
 
@@ -149,17 +184,32 @@ type replicaRecord struct {
 }
 
 func (coordinator *Coordinator) read(ctx context.Context, replicas []cluster.Member, key string) (storage.Record, bool, error) {
-	responses, err := collect(ctx, replicas, func(ctx context.Context, member cluster.Member) (replicaRecord, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	coordinator.pending.Add(1)
+	results := startCalls(ctx, replicas, func(ctx context.Context, member cluster.Member) (replicaRecord, error) {
 		if err := ctx.Err(); err != nil {
 			return replicaRecord{}, err
 		}
+		var record storage.Record
+		var found bool
+		var err error
 		if member.ID == coordinator.localID {
-			record, found := coordinator.store.GetRecord(key)
-			return replicaRecord{record, found}, nil
+			record, found = coordinator.store.GetRecord(key)
+		} else {
+			record, found, err = coordinator.client.GetRecord(ctx, member, key)
 		}
-		record, found, err := coordinator.client.GetRecord(ctx, member, key)
-		return replicaRecord{record, found}, err
-	})
+		if err != nil {
+			return replicaRecord{}, err
+		}
+		if found {
+			if err := record.Validate(); err != nil || record.Key != key {
+				return replicaRecord{}, ErrInvalidResponse
+			}
+		}
+		return replicaRecord{record, found}, nil
+	}, coordinator.pending.Done)
+	responses, err := awaitQuorum(ctx, results, len(replicas), coordinator.readQuorum)
 	if err != nil {
 		return storage.Record{}, false, err
 	}
@@ -170,9 +220,6 @@ func (coordinator *Coordinator) read(ctx context.Context, replicas []cluster.Mem
 			continue
 		}
 		record := response.record
-		if err := record.Validate(); err != nil || record.Key != key {
-			return storage.Record{}, false, ErrInvalidResponse
-		}
 		if previous, found := seen[record.Version]; found && previous != record {
 			return storage.Record{}, false, storage.ErrVersionConflict
 		}
@@ -198,41 +245,4 @@ func (coordinator *Coordinator) replicas(key string) ([]cluster.Member, error) {
 		members = append(members, member)
 	}
 	return members, nil
-}
-
-type replicaResult[T any] struct {
-	index int
-	value T
-	err   error
-}
-
-func collect[T any](ctx context.Context, members []cluster.Member, operation func(context.Context, cluster.Member) (T, error)) ([]T, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	// Each worker can finish even if the caller returns on cancellation.
-	results := make(chan replicaResult[T], len(members))
-	for index, member := range members {
-		go func() {
-			value, err := operation(ctx, member)
-			if err != nil {
-				err = fmt.Errorf("replica %s: %w", member.ID, err)
-			}
-			results <- replicaResult[T]{index, value, err}
-		}()
-	}
-	values := make([]T, len(members))
-	failures := make([]error, len(members))
-	for range members {
-		select {
-		case result := <-results:
-			values[result.index], failures[result.index] = result.value, result.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return values, errors.Join(failures...)
 }

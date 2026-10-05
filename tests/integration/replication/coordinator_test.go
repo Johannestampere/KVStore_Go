@@ -1,6 +1,7 @@
 package replication_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -214,6 +215,10 @@ func TestInternalRecordEndpointStaysLocalAndPreservesVersion(t *testing.T) {
 }
 
 func newCluster(t *testing.T, timeout time.Duration, overrides map[string]http.Handler) *testCluster {
+	return newClusterWithQuorums(t, timeout, overrides, 3, 3)
+}
+
+func newClusterWithQuorums(t *testing.T, timeout time.Duration, overrides map[string]http.Handler, reads, writes int) *testCluster {
 	t.Helper()
 	result := &testCluster{}
 	var members []cluster.Member
@@ -241,10 +246,17 @@ func newCluster(t *testing.T, timeout time.Duration, overrides map[string]http.H
 			t.Fatal(err)
 		}
 		t.Cleanup(client.CloseIdleConnections)
-		coordinator, err := replication.NewCoordinator(replication.Options{LocalID: node.id, Store: node.store, Membership: membership, Ring: result.ring, Client: client, ReplicationFactor: 3, Timeout: 2 * timeout})
+		coordinator, err := replication.NewCoordinator(replication.Options{LocalID: node.id, Store: node.store, Membership: membership, Ring: result.ring, Client: client, ReplicationFactor: 3, ReadQuorum: reads, WriteQuorum: writes, Timeout: 2 * timeout})
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := coordinator.Shutdown(ctx); err != nil {
+				t.Errorf("shutdown coordinator: %v", err)
+			}
+		})
 		mux := http.NewServeMux()
 		mux.Handle("/internal/", api.NewReplicaHandler(node.store))
 		mux.Handle("/", api.NewHandler(coordinator))

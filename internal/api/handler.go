@@ -139,6 +139,8 @@ func writeServiceError(writer http.ResponseWriter, err error) {
 		writeError(writer, http.StatusConflict, "record version is stale")
 	case errors.Is(err, storage.ErrVersionConflict):
 		writeError(writer, http.StatusConflict, "conflicting record for version")
+	case errors.Is(err, replication.ErrQuorumUnavailable):
+		writeError(writer, http.StatusServiceUnavailable, "quorum unavailable")
 	default:
 		slog.Error("key-value operation failed", "error", err)
 		writeError(writer, http.StatusInternalServerError, "internal server error")

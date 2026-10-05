@@ -3,6 +3,7 @@ package storage
 import (
 	"cmp"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -47,4 +48,24 @@ func validateNodeID(nodeID string) error {
 		return errors.New("node ID must be non-empty and have no surrounding whitespace")
 	}
 	return nil
+}
+
+func shouldApply(record, current Record, found bool) (bool, error) {
+	if err := record.Validate(); err != nil {
+		return false, fmt.Errorf("apply record %q: %w", record.Key, err)
+	}
+	if !found {
+		return true, nil
+	}
+	switch record.Version.Compare(current.Version) {
+	case -1:
+		return false, ErrStaleRecord
+	case 0:
+		if record != current {
+			return false, fmt.Errorf("apply record %q: %w", record.Key, ErrVersionConflict)
+		}
+		return false, nil
+	default:
+		return true, nil
+	}
 }

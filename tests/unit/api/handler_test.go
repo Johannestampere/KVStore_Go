@@ -56,6 +56,7 @@ func TestHandlerServiceErrors(t *testing.T) {
 		status int
 	}{
 		{"unavailable", replication.ErrUnavailable, http.StatusServiceUnavailable},
+		{"quorum", replication.ErrQuorumUnavailable, http.StatusServiceUnavailable},
 		{"deadline", context.DeadlineExceeded, http.StatusGatewayTimeout},
 		{"canceled", context.Canceled, http.StatusRequestTimeout},
 		{"invalid response", replication.ErrInvalidResponse, http.StatusBadGateway},

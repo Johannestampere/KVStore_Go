@@ -64,22 +64,12 @@ func (store *MemoryStore) Delete(key string) error {
 // Apply stores a newer record atomically; identical retries return false, nil.
 // Stale records and conflicting contents return errors without changing storage.
 func (store *MemoryStore) Apply(record Record) (bool, error) {
-	if err := record.Validate(); err != nil {
-		return false, fmt.Errorf("apply record %q: %w", record.Key, err)
-	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if current, found := store.records[record.Key]; found {
-		switch record.Version.Compare(current.Version) {
-		case -1:
-			return false, ErrStaleRecord
-		case 0:
-			if record != current {
-				return false, fmt.Errorf("apply record %q: %w", record.Key, ErrVersionConflict)
-			}
-			return false, nil
-		}
+	current, found := store.records[record.Key]
+	if update, err := shouldApply(record, current, found); err != nil || !update {
+		return false, err
 	}
 	store.counter = max(store.counter, record.Version.Counter)
 	store.save(record)
