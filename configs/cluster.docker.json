@@ -1,0 +1,13 @@
+{
+  "virtual_nodes": 64,
+  "replication_factor": 3,
+  "read_quorum": 2,
+  "write_quorum": 2,
+  "members": [
+    {"id": "node-a", "address": "http://node-a:8000"},
+    {"id": "node-b", "address": "http://node-b:8000"},
+    {"id": "node-c", "address": "http://node-c:8000"},
+    {"id": "node-d", "address": "http://node-d:8000"},
+    {"id": "node-e", "address": "http://node-e:8000"}
+  ]
+}

@@ -93,6 +93,7 @@ idle timeout. Startup and shutdown failures exit with a nonzero status.
 | `PUT /kv/{key}` | `204 No Content` | `400` for invalid JSON; `413` for an oversized body; `415` for an unsupported content type |
 | `GET /kv/{key}` | `200` with JSON key and value | `404` when the key is missing |
 | `DELETE /kv/{key}` | `204 No Content`, including missing keys | No error for an already deleted key |
+| `GET /health` | `200` with `{"status":"ok"}` | Reports process liveness only |
 
 PUT requires `Content-Type: application/json` and one JSON object containing a
 string `value`. Empty values are accepted; missing or null values, unknown
@@ -113,6 +114,106 @@ write or conflicting records with the same version. GET returns `404` only
 after a read quorum answers and either none of those responses has a record or
 the highest returned version is a deletion marker. A `404` peer response counts as a successful missing-key
 lookup, not as an unavailable replica.
+
+## Health checks
+
+Both standalone and cluster nodes expose `GET /health`. It returns JSON with
+`Cache-Control: no-store`; `HEAD /health` returns the same status without a body.
+Other methods return `405` with `Allow: GET, HEAD`.
+
+```bash
+curl -i http://127.0.0.1:8001/health
+```
+
+Health means the process can handle this HTTP request. It does not check disk
+writability, contact peers, or guarantee quorum. A node can return `200` here
+while key-value requests fail with `503`. The listener opens after storage
+recovery, so probes cannot succeed while the log is still replaying.
+
+Health status does not change the hash ring or replace unavailable replicas.
+There is no peer-health polling or automatic repair in this milestone.
+
+## Docker cluster
+
+With Docker Engine and Docker Compose running, start all five nodes:
+
+```bash
+docker compose up --build
+```
+
+For background operation with a wait for healthy containers:
+
+```bash
+docker compose up --build -d --wait
+docker compose ps
+```
+
+Stop any manually launched nodes using ports 8001–8005 first. Containers listen
+on port 8000 internally and expose host ports 8001–8005 on `127.0.0.1`.
+`configs/cluster.docker.json` uses service names such as `http://node-a:8000`
+for peer traffic. It keeps the same node IDs, ring settings, and `N=3, R=2, W=2`
+as the local configuration. Host loopback addresses cannot identify other
+containers from inside a container.
+
+The Dockerfile builds the executable in a Go image and copies it into a smaller
+Alpine runtime image. The process runs as the `kvstore` user. Each service has
+its own named volume mounted at `/var/lib/kvstore`, and its log remains bound
+to that node's identity. `.dockerignore` limits build input to application
+source, the Go module, and Docker cluster configuration; local instructions,
+Git history, tests, and data directories are excluded.
+
+Compose probes `/health` every five seconds and allows thirty seconds for
+graceful shutdown before forcing termination. A health failure changes the
+container's reported status; this configuration does not automatically restart
+unhealthy containers or change replica placement. See the
+[Compose service reference](https://docs.docker.com/reference/compose-file/services/)
+for the health-check and shutdown settings.
+
+### Failure and restart demo
+
+With the supplied topology, `node-c` is a replica for both keys below. Write
+one key to preserve across restart and another to exercise quorum operations:
+
+```bash
+curl -i -X PUT http://127.0.0.1:8001/kv/demo:persist \
+  -H 'Content-Type: application/json' -d '{"value":"survives restart"}'
+curl -i -X PUT http://127.0.0.1:8002/kv/demo:quorum \
+  -H 'Content-Type: application/json' -d '{"value":"before failure"}'
+curl -i http://127.0.0.1:8003/internal/records/demo:persist
+```
+
+Before stopping the node, confirm the last request returns `200` with the saved
+record. If it returns `404`, retry after the outstanding replica write finishes.
+Then stop `node-c` and operate through a remaining node:
+
+```bash
+docker compose stop node-c
+curl -i http://127.0.0.1:8002/kv/demo:quorum
+curl -i -X PUT http://127.0.0.1:8002/kv/demo:quorum \
+  -H 'Content-Type: application/json' -d '{"value":"during failure"}'
+curl -i http://127.0.0.1:8002/kv/demo:quorum
+curl -i -X DELETE http://127.0.0.1:8002/kv/demo:quorum
+curl -i http://127.0.0.1:8002/kv/demo:quorum
+```
+
+Expect `200`, `204`, `200` with the updated value, `204`, and `404`.
+Restart the stopped replica with its existing volume:
+
+```bash
+docker compose up -d --wait node-c
+curl -i http://127.0.0.1:8003/internal/records/demo:persist
+curl -i http://127.0.0.1:8002/kv/demo:quorum
+```
+
+The local record still contains `survives restart`, and the quorum read of the
+deleted key returns `404`. Recovery restores the node's own history; updates
+missed while it was stopped are not automatically repaired. Newer tombstones
+on the other replicas win over an older value during a quorum read.
+
+`docker compose down` removes containers and the network while retaining named
+volumes. Running `docker compose up -d --wait` recreates the containers with
+their saved records and counters. `docker compose down --volumes` also deletes
+the stored data; use it only when intentionally resetting this cluster.
 
 ## Cluster startup configuration
 
@@ -258,7 +359,8 @@ be visible to one read quorum and absent from another. Version observation uses
 only its responding quorum, so an unobserved newer version can also reject a
 subsequent write on a replica. Failed or canceled writes may still have effects.
 
-Standalone mode still uses `LocalService` and exposes only the public API.
+Standalone mode uses `LocalService` and exposes the public key-value API and
+`/health`, without internal replication endpoints.
 
 ## One-node failure demo
 
@@ -364,12 +466,16 @@ Persistence tests cover replay, tombstones, unstored version reservations,
 concurrent mutations, uncertain disk errors, incomplete tails, corruption,
 exclusive access, identity checks, and graceful/crash restarts of the compiled
 node in standalone and single-member cluster modes.
+Health tests cover GET, HEAD, unsupported methods, and a running cluster node
+whose key-value requests cannot obtain quorum. Executable lifecycle tests live
+under `tests/integration/node/`; log recovery tests remain under storage.
 
 ```bash
 go vet ./...
 go test -race ./...
 go test -race ./tests/unit/...
 go test -race ./tests/integration/...
+docker compose config --quiet
 ```
 
 Add `-v` to list individual test cases. The race detector reports unsynchronized
@@ -377,11 +483,15 @@ access exercised during a test run; a passing run is not proof that every possib
 execution is race-free. It requires a C compiler, such as the one supplied by
 Apple's Command Line Tools on macOS.
 
+The Go tests do not require Docker. The Docker demo above separately exercises
+container networking, health probes, failure handling, and persistent volumes.
+
 ## Layout
 
 ```text
 cmd/node/main.go                 Server startup and shutdown
 internal/api/handler.go          Public HTTP validation and error responses
+internal/api/health.go           Process liveness endpoint
 internal/api/replica.go          Node-local versioned record endpoints
 internal/cluster/membership.go   Static node IDs and HTTP addresses
 internal/config/config.go        Shared JSON configuration and local identity
@@ -398,6 +508,10 @@ internal/storage/persistent.go   Serialized durable mutations and memory reads
 internal/storage/journal.go      Durable entry and journal contract
 internal/storage/log.go          Framing, checksums, exclusive locking, and replay
 configs/cluster.local.json       Five-node local topology
+configs/cluster.docker.json      Five-node topology using Docker service names
+Dockerfile                      Go build and non-root runtime image
+docker-compose.yml              Five services, health checks, and local volumes
+.dockerignore                   Restricted Docker build context
 tests/unit/api/                  Handler tests with a service spy
 tests/unit/cluster/              Membership validation and lookup tests
 tests/unit/config/               Configuration loading tests
@@ -408,7 +522,8 @@ tests/unit/replication/          Replica coordination and failure tests
 tests/unit/transport/            Peer protocol and cancellation tests
 tests/integration/api/           HTTP tests with real storage
 tests/integration/replication/   Five-node replication tests
-tests/integration/storage/       Log recovery and executable restart tests
+tests/integration/storage/       Log recovery tests
+tests/integration/node/          Executable health and restart tests
 ```
 
 ## Storage contract

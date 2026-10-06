@@ -1,4 +1,4 @@
-package storage_test
+package node_test
 
 import (
 	"bytes"
@@ -28,12 +28,7 @@ type nodeProcess struct {
 }
 
 func TestNodeRecoversAfterGracefulShutdownAndCrash(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "node")
-	build := exec.Command("go", "build", "-race", "-o", binary, "./cmd/node")
-	build.Dir = "../../.."
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build node: %v\n%s", err, output)
-	}
+	binary := buildNode(t)
 	for _, clustered := range []bool{false, true} {
 		t.Run(fmt.Sprintf("clustered_%t", clustered), func(t *testing.T) {
 			directory := t.TempDir()
@@ -47,6 +42,7 @@ func TestNodeRecoversAfterGracefulShutdownAndCrash(t *testing.T) {
 				arguments = append(arguments, "-config", configPath, "-id", "node-a")
 			}
 			node := startNode(t, binary, arguments)
+			assertNodeHealth(t, node)
 			requestNode(t, node, http.MethodPut, "/kv/kept", `{"value":"original"}`, http.StatusNoContent)
 			requestNode(t, node, http.MethodPut, "/kv/deleted", `{"value":"remove me"}`, http.StatusNoContent)
 			requestNode(t, node, http.MethodDelete, "/kv/deleted", "", http.StatusNoContent)
@@ -68,6 +64,7 @@ func TestNodeRecoversAfterGracefulShutdownAndCrash(t *testing.T) {
 			}
 			stopNode(t, node, false)
 			node = startNode(t, binary, arguments)
+			assertNodeHealth(t, node)
 			assertNodeValue(t, node, "kept", "original")
 			requestNode(t, node, http.MethodGet, "/kv/deleted", "", http.StatusNotFound)
 			requestNode(t, node, http.MethodPut, "/kv/after-restart", `{"value":"survives crash"}`, http.StatusNoContent)
@@ -88,6 +85,52 @@ func TestNodeRecoversAfterGracefulShutdownAndCrash(t *testing.T) {
 			requestNode(t, node, http.MethodGet, "/kv/deleted", "", http.StatusNotFound)
 			stopNode(t, node, false)
 		})
+	}
+}
+
+func TestNodeHealthDoesNotRequireQuorum(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "cluster.json")
+	configuration := `{
+		"members": [
+			{"id":"node-a","address":"http://127.0.0.1:1"},
+			{"id":"node-b","address":"http://127.0.0.1:1"},
+			{"id":"node-c","address":"http://127.0.0.1:2"}
+		],
+		"virtual_nodes":8,"replication_factor":3,"read_quorum":2,"write_quorum":2
+	}`
+	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	node := startNode(t, buildNode(t), []string{
+		"-addr", "127.0.0.1:0", "-config", configPath, "-id", "node-a", "-peer-timeout", "100ms",
+	})
+	requestNode(t, node, http.MethodGet, "/kv/missing", "", http.StatusServiceUnavailable)
+	assertNodeHealth(t, node)
+	requestNode(t, node, http.MethodGet, "/health/extra", "", http.StatusNotFound)
+	requestNode(t, node, http.MethodPost, "/health", "", http.StatusMethodNotAllowed)
+	stopNode(t, node, false)
+}
+
+func buildNode(t *testing.T) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "node")
+	build := exec.Command("go", "build", "-race", "-o", binary, "./cmd/node")
+	build.Dir = "../../.."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build node: %v\n%s", err, output)
+	}
+	return binary
+}
+
+func assertNodeHealth(t *testing.T, node *nodeProcess) {
+	t.Helper()
+	body := requestNode(t, node, http.MethodGet, "/health", "", http.StatusOK)
+	if string(body) != `{"status":"ok"}` {
+		t.Fatalf("health response: %s", body)
+	}
+	if body := requestNode(t, node, http.MethodHead, "/health", "", http.StatusOK); len(body) != 0 {
+		t.Fatal("HEAD /health returned a body")
 	}
 }
 

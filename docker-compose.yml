@@ -1,0 +1,44 @@
+x-node: &node
+  build: .
+  image: kvstore-node:local
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 10s
+
+services:
+  node-a:
+    <<: *node
+    command: ["-addr", "0.0.0.0:8000", "-config", "/etc/kvstore/cluster.json", "-id", "node-a", "-data-dir", "/var/lib/kvstore"]
+    ports: ["127.0.0.1:8001:8000"]
+    volumes: ["node-a-data:/var/lib/kvstore"]
+  node-b:
+    <<: *node
+    command: ["-addr", "0.0.0.0:8000", "-config", "/etc/kvstore/cluster.json", "-id", "node-b", "-data-dir", "/var/lib/kvstore"]
+    ports: ["127.0.0.1:8002:8000"]
+    volumes: ["node-b-data:/var/lib/kvstore"]
+  node-c:
+    <<: *node
+    command: ["-addr", "0.0.0.0:8000", "-config", "/etc/kvstore/cluster.json", "-id", "node-c", "-data-dir", "/var/lib/kvstore"]
+    ports: ["127.0.0.1:8003:8000"]
+    volumes: ["node-c-data:/var/lib/kvstore"]
+  node-d:
+    <<: *node
+    command: ["-addr", "0.0.0.0:8000", "-config", "/etc/kvstore/cluster.json", "-id", "node-d", "-data-dir", "/var/lib/kvstore"]
+    ports: ["127.0.0.1:8004:8000"]
+    volumes: ["node-d-data:/var/lib/kvstore"]
+  node-e:
+    <<: *node
+    command: ["-addr", "0.0.0.0:8000", "-config", "/etc/kvstore/cluster.json", "-id", "node-e", "-data-dir", "/var/lib/kvstore"]
+    ports: ["127.0.0.1:8005:8000"]
+    volumes: ["node-e-data:/var/lib/kvstore"]
+
+volumes:
+  node-a-data:
+  node-b-data:
+  node-c-data:
+  node-d-data:
+  node-e-data:

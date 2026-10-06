@@ -72,8 +72,11 @@ func run(arguments []string) (runError error) {
 	if err != nil {
 		return fmt.Errorf("listen on %q: %w", options.address, err)
 	}
+	router := http.NewServeMux()
+	router.Handle("/health", api.HealthHandler{})
+	router.Handle("/", handler)
 	server := &http.Server{
-		Handler:           handler,
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

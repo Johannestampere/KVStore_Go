@@ -1,0 +1,9 @@
+**
+!go.mod
+!cmd/
+!cmd/node/
+!cmd/node/*.go
+!internal/
+!internal/**
+!configs/
+!configs/cluster.docker.json
