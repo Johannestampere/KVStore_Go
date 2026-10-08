@@ -94,6 +94,7 @@ idle timeout. Startup and shutdown failures exit with a nonzero status.
 | `GET /kv/{key}` | `200` with JSON key and value | `404` when the key is missing |
 | `DELETE /kv/{key}` | `204 No Content`, including missing keys | No error for an already deleted key |
 | `GET /health` | `200` with `{"status":"ok"}` | Reports process liveness only |
+| `GET /metrics` | `200` with Prometheus text | Exposes measurements from this node |
 
 PUT requires `Content-Type: application/json` and one JSON object containing a
 string `value`. Empty values are accepted; missing or null values, unknown
@@ -132,6 +133,103 @@ recovery, so probes cannot succeed while the log is still replaying.
 
 Health status does not change the hash ring or replace unavailable replicas.
 There is no peer-health polling or automatic repair in this milestone.
+
+## Metrics
+
+Every node exposes `GET /metrics` in
+[Prometheus text format 0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/).
+`HEAD` returns headers without a body; other methods return `405`. The endpoint
+is available in standalone and cluster modes and does not require quorum.
+
+```bash
+curl -i -X PUT http://127.0.0.1:8001/kv/demo:metrics \
+  -H 'Content-Type: application/json' -d '{"value":"measured"}'
+curl -i http://127.0.0.1:8001/kv/demo:metrics
+curl -s http://127.0.0.1:8001/metrics
+```
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `kvstore_http_requests_total` | Counter | Completed HTTP handler calls, labeled by `scope`, `method`, and `status` |
+| `kvstore_http_request_duration_seconds` | Histogram | Handler duration, labeled by `scope` and `method` |
+| `kvstore_replica_failures_total` | Counter | Failed replica calls observed by this coordinator, labeled by `operation` (`read` or `write`) |
+| `kvstore_quorum_failures_total` | Counter | Phases unable to collect quorum, labeled by `phase` (`read` or `write`) |
+
+HTTP scope is `public` for `/kv/` paths, `internal` for `/internal/` paths, and
+`other` for unmatched paths. Methods are bounded to `GET`, `HEAD`, `PUT`,
+`DELETE`, and `OTHER`. Keys, values, raw paths, query strings, and peer addresses
+are never metric labels. Unexpected instrumentation labels normalize to
+`other` rather than creating new series.
+
+Health probes and metrics scrapes bypass HTTP instrumentation, including their
+unsupported-method responses. Internal replica HTTP requests are counted
+separately from client requests; direct access to a coordinator's own store
+does not generate an internal HTTP request. Counts describe completed handler
+calls and their first final status, not proof that the client received a response.
+Transport-level failures before dispatch and handlers that panic are not counted.
+
+Replica failure counters include failed local and remote attempts, invalid
+responses, version rejections, and deadlines. A valid missing-key response is
+not a failure. Background replica writes can increment these counters after the
+public request succeeds. Calls canceled after quorum, caller cancellation, and
+shutdown cancellation do not count as replica failures; calls skipped because
+their context has already ended are not attempted calls.
+
+A PUT or DELETE first performs a read phase to observe versions. Failure there
+increments the **read** quorum-failure counter and sends no writes. Failure to
+collect enough acknowledgements increments the **write** counter. Quorum
+deadlines count as failures; explicit cancellation does not. A record conflict
+detected after obtaining a read quorum is an HTTP error, but is not a missing
+quorum. This separates individual replica trouble from an unavailable operation.
+
+Latency buckets have inclusive upper bounds of `0.001`, `0.005`, `0.01`,
+`0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2`, `5`, and `10` seconds, plus
+`+Inf`. The endpoint emits cumulative `_bucket` counts, a `_sum`, and a `_count`.
+Durations include successful and failed handler calls, but exclude background
+replication after the handler returns. They measure server-side handler time,
+not client round-trip latency.
+
+The concurrency-safe registry takes a consistent snapshot under a short lock
+and releases it before formatting or writing the response. All measurements
+are node-local and reset on process restart; storage recovery does not restore
+metrics. HTTP series appear after their first observation. Replica and quorum
+failure counters start at zero even in standalone mode.
+
+No Prometheus server or Grafana dashboard is included. An independently running
+Prometheus can scrape every node. For Prometheus running directly on the Docker
+host, a minimal scrape job is:
+
+```yaml
+scrape_configs:
+  - job_name: kvstore
+    scrape_interval: 5s
+    static_configs:
+      - targets:
+          - 127.0.0.1:8001
+          - 127.0.0.1:8002
+          - 127.0.0.1:8003
+          - 127.0.0.1:8004
+          - 127.0.0.1:8005
+```
+
+Use the scrape target's `instance` label to distinguish nodes. These PromQL
+queries calculate public request rate and estimated p95 handler latency:
+
+```promql
+sum(rate(kvstore_http_requests_total{scope="public"}[5m]))
+
+histogram_quantile(0.95,
+  sum by (le) (
+    rate(kvstore_http_request_duration_seconds_bucket{scope="public"}[5m])
+  )
+)
+```
+
+Select `status=~"5.."` for server-error counts or a particular `method` to
+separate reads and writes. Histogram percentiles are estimates from the bucket
+boundaries, not benchmark results. The load-testing CLI and measured throughput
+and latency results remain future work. There is no `healthy_nodes` metric
+because this node does not run a peer-health detector.
 
 ## Docker cluster
 
@@ -359,8 +457,8 @@ be visible to one read quorum and absent from another. Version observation uses
 only its responding quorum, so an unobserved newer version can also reject a
 subsequent write on a replica. Failed or canceled writes may still have effects.
 
-Standalone mode uses `LocalService` and exposes the public key-value API and
-`/health`, without internal replication endpoints.
+Standalone mode uses `LocalService` and exposes the public key-value API,
+`/health`, and `/metrics`, without internal replication endpoints.
 
 ## One-node failure demo
 
@@ -469,6 +567,10 @@ node in standalone and single-member cluster modes.
 Health tests cover GET, HEAD, unsupported methods, and a running cluster node
 whose key-value requests cannot obtain quorum. Executable lifecycle tests live
 under `tests/integration/node/`; log recovery tests remain under storage.
+Metrics tests exercise cumulative histogram boundaries, bounded labels,
+concurrent recording and scraping, HTTP status preservation, background replica
+failures, quorum deadlines, and cancellation exclusions. Executable tests verify
+traffic separation, uncounted probes, and measurement reset after restart.
 
 ```bash
 go vet ./...
@@ -492,6 +594,7 @@ container networking, health probes, failure handling, and persistent volumes.
 cmd/node/main.go                 Server startup and shutdown
 internal/api/handler.go          Public HTTP validation and error responses
 internal/api/health.go           Process liveness endpoint
+internal/api/metrics.go          Prometheus scrape endpoint
 internal/api/replica.go          Node-local versioned record endpoints
 internal/cluster/membership.go   Static node IDs and HTTP addresses
 internal/config/config.go        Shared JSON configuration and local identity
@@ -501,6 +604,10 @@ internal/replication/coordinator.go  Parallel replica reads and writes
 internal/replication/record.go       Strict peer record decoding
 internal/replication/quorum.go       Quorum validation and result collection
 internal/replication/lifecycle.go    Cancellation and graceful draining
+internal/replication/metrics.go      Replica and quorum failure observations
+internal/metrics/registry.go     Concurrent counters and latency buckets
+internal/metrics/http.go         HTTP status and duration instrumentation
+internal/metrics/prometheus.go   Consistent snapshots in Prometheus text format
 internal/transport/http.go       Bounded peer HTTP client
 internal/storage/memory.go       Concurrent versioned storage and logical counter
 internal/storage/record.go       Records, deletion markers, and version ordering
@@ -513,6 +620,7 @@ Dockerfile                      Go build and non-root runtime image
 docker-compose.yml              Five services, health checks, and local volumes
 .dockerignore                   Restricted Docker build context
 tests/unit/api/                  Handler tests with a service spy
+tests/unit/metrics/              Counters, histograms, and HTTP instrumentation
 tests/unit/cluster/              Membership validation and lookup tests
 tests/unit/config/               Configuration loading tests
 tests/unit/consistenthash/       Hash-ring behavior and concurrency tests

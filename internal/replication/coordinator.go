@@ -44,6 +44,7 @@ type Options struct {
 	ReadQuorum        int
 	WriteQuorum       int
 	Timeout           time.Duration
+	Observer          Observer // Optional failure instrumentation.
 }
 
 // Coordinator reads and writes a fixed replica set using overlapping quorums.
@@ -57,6 +58,7 @@ type Coordinator struct {
 	readQuorum        int
 	writeQuorum       int
 	timeout           time.Duration
+	observer          Observer
 	mu                sync.Mutex
 	closing           bool
 	pending           sync.WaitGroup
@@ -101,6 +103,7 @@ func NewCoordinator(options Options) (*Coordinator, error) {
 		membership: options.Membership, ring: options.Ring, client: options.Client,
 		replicationFactor: options.ReplicationFactor, timeout: options.Timeout,
 		readQuorum: options.ReadQuorum, writeQuorum: options.WriteQuorum,
+		observer: options.Observer,
 		lifetime: lifetime, stop: stop, drained: make(chan struct{}),
 	}, nil
 }
@@ -166,12 +169,14 @@ func (coordinator *Coordinator) write(ctx context.Context, record storage.Record
 		} else {
 			err = coordinator.client.Apply(ctx, member, record)
 		}
+		coordinator.observeReplicaFailure("write", err)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			slog.Warn("replica write failed", "node_id", member.ID, "key", record.Key, "error", err)
 		}
 		return struct{}{}, err
 	}, func() { cancelWrites(); coordinator.pending.Done() })
 	_, err = awaitQuorum(ctx, results, len(replicas), coordinator.writeQuorum)
+	coordinator.observeQuorumFailure("write", err)
 	if err != nil {
 		cancelWrites()
 	}
@@ -187,10 +192,11 @@ func (coordinator *Coordinator) read(ctx context.Context, replicas []cluster.Mem
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	coordinator.pending.Add(1)
-	results := startCalls(ctx, replicas, func(ctx context.Context, member cluster.Member) (replicaRecord, error) {
+	results := startCalls(ctx, replicas, func(ctx context.Context, member cluster.Member) (result replicaRecord, readError error) {
 		if err := ctx.Err(); err != nil {
 			return replicaRecord{}, err
 		}
+		defer func() { coordinator.observeReplicaFailure("read", readError) }()
 		var record storage.Record
 		var found bool
 		var err error
@@ -210,6 +216,7 @@ func (coordinator *Coordinator) read(ctx context.Context, replicas []cluster.Mem
 		return replicaRecord{record, found}, nil
 	}, coordinator.pending.Done)
 	responses, err := awaitQuorum(ctx, results, len(replicas), coordinator.readQuorum)
+	coordinator.observeQuorumFailure("read", err)
 	if err != nil {
 		return storage.Record{}, false, err
 	}

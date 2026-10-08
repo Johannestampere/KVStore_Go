@@ -106,6 +106,10 @@ func TestNodeHealthDoesNotRequireQuorum(t *testing.T) {
 		"-addr", "127.0.0.1:0", "-config", configPath, "-id", "node-a", "-peer-timeout", "100ms",
 	})
 	requestNode(t, node, http.MethodGet, "/kv/missing", "", http.StatusServiceUnavailable)
+	waitMetrics(t, node,
+		`kvstore_http_requests_total{scope="public",method="GET",status="503"} 1`,
+		`kvstore_quorum_failures_total{phase="read"} 1`,
+	)
 	assertNodeHealth(t, node)
 	requestNode(t, node, http.MethodGet, "/health/extra", "", http.StatusNotFound)
 	requestNode(t, node, http.MethodPost, "/health", "", http.StatusMethodNotAllowed)

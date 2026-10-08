@@ -15,6 +15,7 @@ import (
 
 	"kvstore/internal/api"
 	"kvstore/internal/config"
+	"kvstore/internal/metrics"
 	"kvstore/internal/replication"
 	"kvstore/internal/routing"
 	"kvstore/internal/storage"
@@ -50,7 +51,8 @@ func run(arguments []string) (runError error) {
 		return err
 	}
 	defer peerClient.CloseIdleConnections()
-	handler, drain, err := buildHandler(options, peerClient)
+	registry := &metrics.Registry{}
+	handler, drain, err := buildHandler(options, peerClient, registry)
 	if err != nil {
 		return err
 	}
@@ -74,7 +76,8 @@ func run(arguments []string) (runError error) {
 	}
 	router := http.NewServeMux()
 	router.Handle("/health", api.HealthHandler{})
-	router.Handle("/", handler)
+	router.Handle("/metrics", api.NewMetricsHandler(registry))
+	router.Handle("/", registry.InstrumentHTTP(handler))
 	server := &http.Server{
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -105,7 +108,7 @@ func run(arguments []string) (runError error) {
 	return nil
 }
 
-func buildHandler(options nodeOptions, peerClient replication.ReplicaClient) (http.Handler, func(context.Context) error, error) {
+func buildHandler(options nodeOptions, peerClient replication.ReplicaClient, registry *metrics.Registry) (http.Handler, func(context.Context) error, error) {
 	var topology *config.Config
 	if options.configPath != "" {
 		var err error
@@ -121,7 +124,12 @@ func buildHandler(options nodeOptions, peerClient replication.ReplicaClient) (ht
 	if topology == nil {
 		return api.NewHandler(routing.NewLocalService(store)), func(context.Context) error { return closeStore() }, nil
 	}
-	handler, drain, err := buildClusterHandler(topology, options, peerClient, store)
+	handler, drain, err := buildClusterHandler(topology, replication.Options{
+		LocalID: topology.Local.ID, Store: store, Membership: topology.Membership,
+		Ring: topology.Ring, Client: peerClient, Observer: registry,
+		ReplicationFactor: topology.ReplicationFactor, Timeout: options.requestTimeout,
+		ReadQuorum: topology.ReadQuorum, WriteQuorum: topology.WriteQuorum,
+	})
 	if err != nil {
 		return nil, nil, errors.Join(err, closeStore())
 	}
@@ -153,18 +161,13 @@ func openStorage(options nodeOptions) (nodeStore, func() error, error) {
 	return store, func() error { return nil }, err
 }
 
-func buildClusterHandler(topology *config.Config, options nodeOptions, peerClient replication.ReplicaClient, store nodeStore) (http.Handler, func(context.Context) error, error) {
-	coordinator, err := replication.NewCoordinator(replication.Options{
-		LocalID: topology.Local.ID, Store: store, Membership: topology.Membership,
-		Ring: topology.Ring, Client: peerClient,
-		ReplicationFactor: topology.ReplicationFactor, Timeout: options.requestTimeout,
-		ReadQuorum: topology.ReadQuorum, WriteQuorum: topology.WriteQuorum,
-	})
+func buildClusterHandler(topology *config.Config, options replication.Options) (http.Handler, func(context.Context) error, error) {
+	coordinator, err := replication.NewCoordinator(options)
 	if err != nil {
 		return nil, nil, fmt.Errorf("configure replication: %w", err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/internal/", api.NewReplicaHandler(store))
+	mux.Handle("/internal/", api.NewReplicaHandler(options.Store))
 	mux.Handle("/", api.NewHandler(coordinator))
 	slog.Info("cluster replication configured", "node_id", topology.Local.ID,
 		"advertised_address", topology.Local.Address, "members", len(topology.Membership.NodeIDs()),
