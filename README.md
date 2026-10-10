@@ -227,9 +227,87 @@ histogram_quantile(0.95,
 
 Select `status=~"5.."` for server-error counts or a particular `method` to
 separate reads and writes. Histogram percentiles are estimates from the bucket
-boundaries, not benchmark results. The load-testing CLI and measured throughput
-and latency results remain future work. There is no `healthy_nodes` metric
+boundaries, not benchmark results. The benchmark CLI below measures individual
+client requests. There is no `healthy_nodes` metric
 because this node does not run a peer-health detector.
+
+## Benchmark CLI
+
+Run a fixed-concurrency workload against a running node or cluster:
+
+```bash
+go run ./cmd/bench \
+  -nodes http://127.0.0.1:8001,http://127.0.0.1:8002,http://127.0.0.1:8003,http://127.0.0.1:8004,http://127.0.0.1:8005 \
+  -requests 10000 -concurrency 20 -read-percent 50 \
+  -keys 1000 -value-bytes 256 -timeout 5s \
+  -description '5 nodes; N=3 R=2 W=2; persistent storage; record hardware separately'
+```
+
+Use `-read-percent 100` for GET-only, `0` for PUT-only, or an intermediate
+percentage for a mixed workload. `-format json` emits a machine-readable report
+on stdout; diagnostics go to stderr. `-h` lists all options. The CLI exits
+nonzero on invalid settings, failed preparation, cancellation, or any measured
+request failure, while still writing a report for runs that started.
+
+**Workload semantics:**
+
+- Read workloads first preload `-keys` values using the same concurrency limit.
+  Preparation has its own report and is excluded from measured time and counts.
+  Failed preparation aborts the run rather than benchmarking missing keys.
+- GETs cycle through the preloaded keys and validate the returned key and value.
+  PUTs insert unique keys in a separate namespace. Mixed workloads do not model
+  updates to hot keys, concurrent writes to the same key, or read-after-write
+  consistency. Values are repeated ASCII `x` bytes of the configured size.
+- Each run generates a unique key prefix. Generated keys remain in storage;
+  use a disposable cluster for repeated experiments. There is no automatic
+  cleanup or deletion workload.
+- Reads are evenly interleaved with writes: the total GET count is
+  `floor(requests * read_percent / 100)`. Each method independently rotates
+  across the supplied entry nodes. This is not a random or Zipfian workload.
+- At most `min(concurrency, requests)` workers execute measured requests. Each
+  waits for a complete response before issuing another: a **closed-loop** load
+  generator. There are no application-level retries or redirect following.
+- The request timeout covers connection setup and reading the response body.
+  Transport errors, timeouts, unexpected status codes, and invalid GET responses
+  count as failures. Ctrl-C cancels in-flight work and reports attempted requests;
+  unissued requests are not fabricated as observations.
+
+**Measurement methodology:**
+
+- Latency runs from request construction through response-body reading,
+  validation, and closing. Connection establishment and pool waits are included.
+- Reports include successful operations/second, error rate, status counts, and
+  nearest-rank p50/p95/p99 latency in milliseconds, both overall and per method.
+  All-attempt and successful-only latency distributions are reported separately.
+  Empty distributions are `null` in JSON, rather than fabricated zero latency.
+- Throughput is successful requests divided by measured wall time. Per-method
+  rates use that same interval, so GET and PUT throughput sum to total throughput.
+  Worker startup/draining is included; payload preparation, preload, summary
+  calculation, and report output are excluded. Reports retain O(requests)
+  observations to calculate exact sample percentiles.
+- Connections are reused. Preload warms read workloads; PUT-only workloads begin
+  with cold connections. There is no separate steady-state warmup period.
+- Closed-loop measurements reduce offered load during stalls and do not measure
+  an externally scheduled arrival stream. They can underrepresent latency under
+  sustained overload (coordinated omission). Percentiles describe observed
+  requests, not an open-loop service-level guarantee.
+- Record hardware, topology, N/R/W, storage mode, deadlines, and concurrent load
+  with each experiment. The CLI cannot discover these server settings; put them
+  in `-description` and accompanying notes. JSON also records workload settings,
+  the Go runtime/platform, key prefix, and measured-phase start time.
+
+For a replica-failure experiment, keep the static membership unchanged, stop one
+node, and supply only surviving entry-node URLs. Keeping a stopped node in the
+client URL list measures direct connection failures as well as replica failures.
+Run against disposable data and retain the same workload settings for comparison.
+
+An initial [local benchmark report](docs/benchmarks/local-2026-10-08.md) records
+six persistent-cluster runs on an Apple M5 Pro with 24 GiB RAM. With 20 concurrent
+clients, 256-byte values, and a 50/50 GET/PUT workload, median run throughput was
+248.41 successful ops/s with all five nodes running and 244.38 ops/s with one
+replica stopped. All 30,000 measured requests succeeded. These short, shared-host
+runs demonstrate the workload and failure case; they are not a capacity claim.
+The report includes raw JSON, per-method latency, settings, and reproduction steps.
 
 ## Docker cluster
 
@@ -592,6 +670,11 @@ container networking, health probes, failure handling, and persistent volumes.
 
 ```text
 cmd/node/main.go                 Server startup and shutdown
+cmd/bench/main.go                Benchmark flags, reporting, and exit status
+internal/benchmark/config.go     Workload configuration and validation
+internal/benchmark/runner.go     Bounded workers, preload, and workload selection
+internal/benchmark/http.go       Timed requests and response validation
+internal/benchmark/result.go     Throughput, errors, and latency percentiles
 internal/api/handler.go          Public HTTP validation and error responses
 internal/api/health.go           Process liveness endpoint
 internal/api/metrics.go          Prometheus scrape endpoint
@@ -620,6 +703,7 @@ Dockerfile                      Go build and non-root runtime image
 docker-compose.yml              Five services, health checks, and local volumes
 .dockerignore                   Restricted Docker build context
 tests/unit/api/                  Handler tests with a service spy
+tests/unit/benchmark/            Workload validation and statistical calculations
 tests/unit/metrics/              Counters, histograms, and HTTP instrumentation
 tests/unit/cluster/              Membership validation and lookup tests
 tests/unit/config/               Configuration loading tests
@@ -629,6 +713,7 @@ tests/unit/routing/              Local service cancellation and errors
 tests/unit/replication/          Replica coordination and failure tests
 tests/unit/transport/            Peer protocol and cancellation tests
 tests/integration/api/           HTTP tests with real storage
+tests/integration/benchmark/     Workload execution, failures, cancellation, and CLI
 tests/integration/replication/   Five-node replication tests
 tests/integration/storage/       Log recovery tests
 tests/integration/node/          Executable health and restart tests

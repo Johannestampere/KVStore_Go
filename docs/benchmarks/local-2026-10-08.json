@@ -1,0 +1,920 @@
+{
+  "date": "2026-10-08",
+  "environment": {
+    "cpu": "Apple M5 Pro",
+    "memory_bytes": 25769803776,
+    "os": "macOS 26.6.2",
+    "go": "go version go1.27.1 darwin/arm64",
+    "base_commit": "d178d5810ab2ade12cad7fd696c93010d5bf273d",
+    "source_state": "uncommitted benchmark CLI implementation on base_commit",
+    "deployment": "five native node processes and client on the same host; no race instrumentation",
+    "benchmark_source_sha256": {
+      "internal/benchmark/config.go": "fa9c946051dc847c8029f2f953cc4e72501c11d3da20c2165ea8f64ea3fe83eb",
+      "internal/benchmark/http.go": "e3ff62bd8b6800e0f62e73f5813251ef2205cc9736d2ba879fdedf864a5e3cf8",
+      "internal/benchmark/result.go": "0545cbf3bc8d97eb983337ea5a59293d5ba9a0159b24b823db6e40c89afbd05e",
+      "internal/benchmark/runner.go": "0b91d14b6e0f8421a0150dfb68d66eb884a6eab144e4fb6d79c351b48c8ed1d1",
+      "cmd/bench/main.go": "f8530f2a48ba0b151d26efe836a3abb1d98f3cb9db1ef600fdf027f1b1437bb1"
+    }
+  },
+  "server_settings": {
+    "virtual_nodes": 64,
+    "replication_factor": 3,
+    "read_quorum": 2,
+    "write_quorum": 2,
+    "peer_timeout": "2s",
+    "request_timeout": "5s",
+    "storage": "per-node append-only logs with File.Sync"
+  },
+  "methodology": "Three consecutive 5000-request 50/50 GET/PUT runs per condition, concurrency 20, 1000 preloaded read keys, 256-byte values, client timeout 5s. Healthy first, then node-e stopped. Unique keys per run; storage retained between runs. Preparation excluded; no separate warmup. Local smoke measurements, not a capacity benchmark.",
+  "runs": [
+    {
+      "condition": "healthy",
+      "repetition": 1,
+      "exit_code": 0,
+      "report": {
+        "config": {
+          "nodes": [
+            "http://127.0.0.1:53598",
+            "http://127.0.0.1:53599",
+            "http://127.0.0.1:53600",
+            "http://127.0.0.1:53601",
+            "http://127.0.0.1:53602"
+          ],
+          "requests": 5000,
+          "concurrency": 20,
+          "read_percent": 50,
+          "read_keys": 1000,
+          "value_bytes": 256,
+          "request_timeout_ns": 5000000000,
+          "description": "5 native nodes; N=3 R=2 W=2; File.Sync persistence; healthy; repetition 1; Apple M5 Pro 24 GiB; shared host"
+        },
+        "key_prefix": "bench-VZUOT63HWL572IYFXXOOKIXVRK",
+        "started_at": "2026-10-08T22:40:01.394738Z",
+        "go_version": "go1.27.1",
+        "platform": "darwin/arm64",
+        "completed": true,
+        "preparation": {
+          "elapsed_seconds": 8.053620541,
+          "total": {
+            "attempted": 1000,
+            "succeeded": 1000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 124.16775721045235,
+            "all_latency_ms": {
+              "p50": 106.983833,
+              "p95": 465.985792,
+              "p99": 505.30825
+            },
+            "successful_latency_ms": {
+              "p50": 106.983833,
+              "p95": 465.985792,
+              "p99": 505.30825
+            },
+            "failures": {},
+            "status_codes": {
+              "204": 1000
+            }
+          },
+          "methods": {
+            "PUT": {
+              "attempted": 1000,
+              "succeeded": 1000,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 124.16775721045235,
+              "all_latency_ms": {
+                "p50": 106.983833,
+                "p95": 465.985792,
+                "p99": 505.30825
+              },
+              "successful_latency_ms": {
+                "p50": 106.983833,
+                "p95": 465.985792,
+                "p99": 505.30825
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 1000
+              }
+            }
+          }
+        },
+        "measurements": {
+          "elapsed_seconds": 20.402430458,
+          "total": {
+            "attempted": 5000,
+            "succeeded": 5000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 245.06884168986096,
+            "all_latency_ms": {
+              "p50": 16.416625,
+              "p95": 271.718291,
+              "p99": 353.341125
+            },
+            "successful_latency_ms": {
+              "p50": 16.416625,
+              "p95": 271.718291,
+              "p99": 353.341125
+            },
+            "failures": {},
+            "status_codes": {
+              "200": 2500,
+              "204": 2500
+            }
+          },
+          "methods": {
+            "GET": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 122.53442084493048,
+              "all_latency_ms": {
+                "p50": 0.326375,
+                "p95": 0.868416,
+                "p99": 9.16925
+              },
+              "successful_latency_ms": {
+                "p50": 0.326375,
+                "p95": 0.868416,
+                "p99": 9.16925
+              },
+              "failures": {},
+              "status_codes": {
+                "200": 2500
+              }
+            },
+            "PUT": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 122.53442084493048,
+              "all_latency_ms": {
+                "p50": 152.15925,
+                "p95": 312.660083,
+                "p99": 377.881
+              },
+              "successful_latency_ms": {
+                "p50": 152.15925,
+                "p95": 312.660083,
+                "p99": 377.881
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 2500
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "condition": "healthy",
+      "repetition": 2,
+      "exit_code": 0,
+      "report": {
+        "config": {
+          "nodes": [
+            "http://127.0.0.1:53598",
+            "http://127.0.0.1:53599",
+            "http://127.0.0.1:53600",
+            "http://127.0.0.1:53601",
+            "http://127.0.0.1:53602"
+          ],
+          "requests": 5000,
+          "concurrency": 20,
+          "read_percent": 50,
+          "read_keys": 1000,
+          "value_bytes": 256,
+          "request_timeout_ns": 5000000000,
+          "description": "5 native nodes; N=3 R=2 W=2; File.Sync persistence; healthy; repetition 2; Apple M5 Pro 24 GiB; shared host"
+        },
+        "key_prefix": "bench-OMLL6I5PZZNM3PJFOCALNIG5PG",
+        "started_at": "2026-10-08T22:40:29.777831Z",
+        "go_version": "go1.27.1",
+        "platform": "darwin/arm64",
+        "completed": true,
+        "preparation": {
+          "elapsed_seconds": 7.960679916,
+          "total": {
+            "attempted": 1000,
+            "succeeded": 1000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 125.61741089352448,
+            "all_latency_ms": {
+              "p50": 150.871208,
+              "p95": 267.034667,
+              "p99": 314.119333
+            },
+            "successful_latency_ms": {
+              "p50": 150.871208,
+              "p95": 267.034667,
+              "p99": 314.119333
+            },
+            "failures": {},
+            "status_codes": {
+              "204": 1000
+            }
+          },
+          "methods": {
+            "PUT": {
+              "attempted": 1000,
+              "succeeded": 1000,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 125.61741089352448,
+              "all_latency_ms": {
+                "p50": 150.871208,
+                "p95": 267.034667,
+                "p99": 314.119333
+              },
+              "successful_latency_ms": {
+                "p50": 150.871208,
+                "p95": 267.034667,
+                "p99": 314.119333
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 1000
+              }
+            }
+          }
+        },
+        "measurements": {
+          "elapsed_seconds": 20.127777875,
+          "total": {
+            "attempted": 5000,
+            "succeeded": 5000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 248.41291627181175,
+            "all_latency_ms": {
+              "p50": 11.702209,
+              "p95": 328.097125,
+              "p99": 469.656416
+            },
+            "successful_latency_ms": {
+              "p50": 11.702209,
+              "p95": 328.097125,
+              "p99": 469.656416
+            },
+            "failures": {},
+            "status_codes": {
+              "200": 2500,
+              "204": 2500
+            }
+          },
+          "methods": {
+            "GET": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 124.20645813590588,
+              "all_latency_ms": {
+                "p50": 0.313167,
+                "p95": 0.636792,
+                "p99": 9.117542
+              },
+              "successful_latency_ms": {
+                "p50": 0.313167,
+                "p95": 0.636792,
+                "p99": 9.117542
+              },
+              "failures": {},
+              "status_codes": {
+                "200": 2500
+              }
+            },
+            "PUT": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 124.20645813590588,
+              "all_latency_ms": {
+                "p50": 126.661125,
+                "p95": 417.341334,
+                "p99": 492.957667
+              },
+              "successful_latency_ms": {
+                "p50": 126.661125,
+                "p95": 417.341334,
+                "p99": 492.957667
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 2500
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "condition": "healthy",
+      "repetition": 3,
+      "exit_code": 0,
+      "report": {
+        "config": {
+          "nodes": [
+            "http://127.0.0.1:53598",
+            "http://127.0.0.1:53599",
+            "http://127.0.0.1:53600",
+            "http://127.0.0.1:53601",
+            "http://127.0.0.1:53602"
+          ],
+          "requests": 5000,
+          "concurrency": 20,
+          "read_percent": 50,
+          "read_keys": 1000,
+          "value_bytes": 256,
+          "request_timeout_ns": 5000000000,
+          "description": "5 native nodes; N=3 R=2 W=2; File.Sync persistence; healthy; repetition 3; Apple M5 Pro 24 GiB; shared host"
+        },
+        "key_prefix": "bench-R6K4HSO7UA423D56P5U5VSZM3U",
+        "started_at": "2026-10-08T22:40:57.881702Z",
+        "go_version": "go1.27.1",
+        "platform": "darwin/arm64",
+        "completed": true,
+        "preparation": {
+          "elapsed_seconds": 7.951629666,
+          "total": {
+            "attempted": 1000,
+            "succeeded": 1000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 125.76038397208727,
+            "all_latency_ms": {
+              "p50": 152.890084,
+              "p95": 262.101208,
+              "p99": 311.940083
+            },
+            "successful_latency_ms": {
+              "p50": 152.890084,
+              "p95": 262.101208,
+              "p99": 311.940083
+            },
+            "failures": {},
+            "status_codes": {
+              "204": 1000
+            }
+          },
+          "methods": {
+            "PUT": {
+              "attempted": 1000,
+              "succeeded": 1000,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 125.76038397208727,
+              "all_latency_ms": {
+                "p50": 152.890084,
+                "p95": 262.101208,
+                "p99": 311.940083
+              },
+              "successful_latency_ms": {
+                "p50": 152.890084,
+                "p95": 262.101208,
+                "p99": 311.940083
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 1000
+              }
+            }
+          }
+        },
+        "measurements": {
+          "elapsed_seconds": 19.89132575,
+          "total": {
+            "attempted": 5000,
+            "succeeded": 5000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 251.36584975991357,
+            "all_latency_ms": {
+              "p50": 10.685875,
+              "p95": 251.531375,
+              "p99": 317.632541
+            },
+            "successful_latency_ms": {
+              "p50": 10.685875,
+              "p95": 251.531375,
+              "p99": 317.632541
+            },
+            "failures": {},
+            "status_codes": {
+              "200": 2500,
+              "204": 2500
+            }
+          },
+          "methods": {
+            "GET": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 125.68292487995679,
+              "all_latency_ms": {
+                "p50": 0.302709,
+                "p95": 0.55375,
+                "p99": 6.342334
+              },
+              "successful_latency_ms": {
+                "p50": 0.302709,
+                "p95": 0.55375,
+                "p99": 6.342334
+              },
+              "failures": {},
+              "status_codes": {
+                "200": 2500
+              }
+            },
+            "PUT": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 125.68292487995679,
+              "all_latency_ms": {
+                "p50": 152.662209,
+                "p95": 281.962875,
+                "p99": 338.823708
+              },
+              "successful_latency_ms": {
+                "p50": 152.662209,
+                "p95": 281.962875,
+                "p99": 338.823708
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 2500
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "condition": "node-e-stopped",
+      "repetition": 1,
+      "exit_code": 0,
+      "report": {
+        "config": {
+          "nodes": [
+            "http://127.0.0.1:53598",
+            "http://127.0.0.1:53599",
+            "http://127.0.0.1:53600",
+            "http://127.0.0.1:53601"
+          ],
+          "requests": 5000,
+          "concurrency": 20,
+          "read_percent": 50,
+          "read_keys": 1000,
+          "value_bytes": 256,
+          "request_timeout_ns": 5000000000,
+          "description": "5 native nodes; N=3 R=2 W=2; File.Sync persistence; node-e-stopped; repetition 1; Apple M5 Pro 24 GiB; shared host"
+        },
+        "key_prefix": "bench-K7X5QGT3TBSUBLYYRRJ3D4VVMX",
+        "started_at": "2026-10-08T22:41:25.979512Z",
+        "go_version": "go1.27.1",
+        "platform": "darwin/arm64",
+        "completed": true,
+        "preparation": {
+          "elapsed_seconds": 8.178882416,
+          "total": {
+            "attempted": 1000,
+            "succeeded": 1000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 122.2660932309948,
+            "all_latency_ms": {
+              "p50": 147.91975,
+              "p95": 348.144667,
+              "p99": 407.871875
+            },
+            "successful_latency_ms": {
+              "p50": 147.91975,
+              "p95": 348.144667,
+              "p99": 407.871875
+            },
+            "failures": {},
+            "status_codes": {
+              "204": 1000
+            }
+          },
+          "methods": {
+            "PUT": {
+              "attempted": 1000,
+              "succeeded": 1000,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 122.2660932309948,
+              "all_latency_ms": {
+                "p50": 147.91975,
+                "p95": 348.144667,
+                "p99": 407.871875
+              },
+              "successful_latency_ms": {
+                "p50": 147.91975,
+                "p95": 348.144667,
+                "p99": 407.871875
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 1000
+              }
+            }
+          }
+        },
+        "measurements": {
+          "elapsed_seconds": 20.364848334,
+          "total": {
+            "attempted": 5000,
+            "succeeded": 5000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 245.52110175317546,
+            "all_latency_ms": {
+              "p50": 18.22075,
+              "p95": 250.6925,
+              "p99": 366.803792
+            },
+            "successful_latency_ms": {
+              "p50": 18.22075,
+              "p95": 250.6925,
+              "p99": 366.803792
+            },
+            "failures": {},
+            "status_codes": {
+              "200": 2500,
+              "204": 2500
+            }
+          },
+          "methods": {
+            "GET": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 122.76055087658773,
+              "all_latency_ms": {
+                "p50": 0.288833,
+                "p95": 0.534,
+                "p99": 6.327375
+              },
+              "successful_latency_ms": {
+                "p50": 0.288833,
+                "p95": 0.534,
+                "p99": 6.327375
+              },
+              "failures": {},
+              "status_codes": {
+                "200": 2500
+              }
+            },
+            "PUT": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 122.76055087658773,
+              "all_latency_ms": {
+                "p50": 158.668083,
+                "p95": 281.719708,
+                "p99": 414.496583
+              },
+              "successful_latency_ms": {
+                "p50": 158.668083,
+                "p95": 281.719708,
+                "p99": 414.496583
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 2500
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "condition": "node-e-stopped",
+      "repetition": 2,
+      "exit_code": 0,
+      "report": {
+        "config": {
+          "nodes": [
+            "http://127.0.0.1:53598",
+            "http://127.0.0.1:53599",
+            "http://127.0.0.1:53600",
+            "http://127.0.0.1:53601"
+          ],
+          "requests": 5000,
+          "concurrency": 20,
+          "read_percent": 50,
+          "read_keys": 1000,
+          "value_bytes": 256,
+          "request_timeout_ns": 5000000000,
+          "description": "5 native nodes; N=3 R=2 W=2; File.Sync persistence; node-e-stopped; repetition 2; Apple M5 Pro 24 GiB; shared host"
+        },
+        "key_prefix": "bench-42AXYBRC6G3D32LBWNWFCMX5BY",
+        "started_at": "2026-10-08T22:41:54.485904Z",
+        "go_version": "go1.27.1",
+        "platform": "darwin/arm64",
+        "completed": true,
+        "preparation": {
+          "elapsed_seconds": 8.12478425,
+          "total": {
+            "attempted": 1000,
+            "succeeded": 1000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 123.08019132938823,
+            "all_latency_ms": {
+              "p50": 154.925375,
+              "p95": 267.933209,
+              "p99": 309.818041
+            },
+            "successful_latency_ms": {
+              "p50": 154.925375,
+              "p95": 267.933209,
+              "p99": 309.818041
+            },
+            "failures": {},
+            "status_codes": {
+              "204": 1000
+            }
+          },
+          "methods": {
+            "PUT": {
+              "attempted": 1000,
+              "succeeded": 1000,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 123.08019132938823,
+              "all_latency_ms": {
+                "p50": 154.925375,
+                "p95": 267.933209,
+                "p99": 309.818041
+              },
+              "successful_latency_ms": {
+                "p50": 154.925375,
+                "p95": 267.933209,
+                "p99": 309.818041
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 1000
+              }
+            }
+          }
+        },
+        "measurements": {
+          "elapsed_seconds": 20.459925792,
+          "total": {
+            "attempted": 5000,
+            "succeeded": 5000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 244.38016299917575,
+            "all_latency_ms": {
+              "p50": 11.334334,
+              "p95": 255.798917,
+              "p99": 396.410625
+            },
+            "successful_latency_ms": {
+              "p50": 11.334334,
+              "p95": 255.798917,
+              "p99": 396.410625
+            },
+            "failures": {},
+            "status_codes": {
+              "200": 2500,
+              "204": 2500
+            }
+          },
+          "methods": {
+            "GET": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 122.19008149958788,
+              "all_latency_ms": {
+                "p50": 0.295959,
+                "p95": 0.538125,
+                "p99": 6.019667
+              },
+              "successful_latency_ms": {
+                "p50": 0.295959,
+                "p95": 0.538125,
+                "p99": 6.019667
+              },
+              "failures": {},
+              "status_codes": {
+                "200": 2500
+              }
+            },
+            "PUT": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 122.19008149958788,
+              "all_latency_ms": {
+                "p50": 155.748083,
+                "p95": 284.601292,
+                "p99": 416.635792
+              },
+              "successful_latency_ms": {
+                "p50": 155.748083,
+                "p95": 284.601292,
+                "p99": 416.635792
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 2500
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "condition": "node-e-stopped",
+      "repetition": 3,
+      "exit_code": 0,
+      "report": {
+        "config": {
+          "nodes": [
+            "http://127.0.0.1:53598",
+            "http://127.0.0.1:53599",
+            "http://127.0.0.1:53600",
+            "http://127.0.0.1:53601"
+          ],
+          "requests": 5000,
+          "concurrency": 20,
+          "read_percent": 50,
+          "read_keys": 1000,
+          "value_bytes": 256,
+          "request_timeout_ns": 5000000000,
+          "description": "5 native nodes; N=3 R=2 W=2; File.Sync persistence; node-e-stopped; repetition 3; Apple M5 Pro 24 GiB; shared host"
+        },
+        "key_prefix": "bench-Y6KSIFHIRXHCL32MVBTTDEJBKD",
+        "started_at": "2026-10-08T22:42:23.003352Z",
+        "go_version": "go1.27.1",
+        "platform": "darwin/arm64",
+        "completed": true,
+        "preparation": {
+          "elapsed_seconds": 8.041283584,
+          "total": {
+            "attempted": 1000,
+            "succeeded": 1000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 124.35825568815059,
+            "all_latency_ms": {
+              "p50": 158.005333,
+              "p95": 239.002375,
+              "p99": 275.021125
+            },
+            "successful_latency_ms": {
+              "p50": 158.005333,
+              "p95": 239.002375,
+              "p99": 275.021125
+            },
+            "failures": {},
+            "status_codes": {
+              "204": 1000
+            }
+          },
+          "methods": {
+            "PUT": {
+              "attempted": 1000,
+              "succeeded": 1000,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 124.35825568815059,
+              "all_latency_ms": {
+                "p50": 158.005333,
+                "p95": 239.002375,
+                "p99": 275.021125
+              },
+              "successful_latency_ms": {
+                "p50": 158.005333,
+                "p95": 239.002375,
+                "p99": 275.021125
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 1000
+              }
+            }
+          }
+        },
+        "measurements": {
+          "elapsed_seconds": 20.8236885,
+          "total": {
+            "attempted": 5000,
+            "succeeded": 5000,
+            "failed": 0,
+            "error_rate": 0,
+            "successful_ops_per_second": 240.11115994171735,
+            "all_latency_ms": {
+              "p50": 10.440125,
+              "p95": 258.041792,
+              "p99": 403.588792
+            },
+            "successful_latency_ms": {
+              "p50": 10.440125,
+              "p95": 258.041792,
+              "p99": 403.588792
+            },
+            "failures": {},
+            "status_codes": {
+              "200": 2500,
+              "204": 2500
+            }
+          },
+          "methods": {
+            "GET": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 120.05557997085867,
+              "all_latency_ms": {
+                "p50": 0.316959,
+                "p95": 0.586958,
+                "p99": 3.356375
+              },
+              "successful_latency_ms": {
+                "p50": 0.316959,
+                "p95": 0.586958,
+                "p99": 3.356375
+              },
+              "failures": {},
+              "status_codes": {
+                "200": 2500
+              }
+            },
+            "PUT": {
+              "attempted": 2500,
+              "succeeded": 2500,
+              "failed": 0,
+              "error_rate": 0,
+              "successful_ops_per_second": 120.05557997085867,
+              "all_latency_ms": {
+                "p50": 164.479125,
+                "p95": 293.403167,
+                "p99": 433.780458
+              },
+              "successful_latency_ms": {
+                "p50": 164.479125,
+                "p95": 293.403167,
+                "p99": 433.780458
+              },
+              "failures": {},
+              "status_codes": {
+                "204": 2500
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "topology": {
+    "virtual_nodes": 64,
+    "replication_factor": 3,
+    "read_quorum": 2,
+    "write_quorum": 2,
+    "members": [
+      {
+        "id": "node-a",
+        "address": "http://127.0.0.1:53598"
+      },
+      {
+        "id": "node-b",
+        "address": "http://127.0.0.1:53599"
+      },
+      {
+        "id": "node-c",
+        "address": "http://127.0.0.1:53600"
+      },
+      {
+        "id": "node-d",
+        "address": "http://127.0.0.1:53601"
+      },
+      {
+        "id": "node-e",
+        "address": "http://127.0.0.1:53602"
+      }
+    ]
+  }
+}
