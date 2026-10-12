@@ -7,13 +7,8 @@ import (
 	"sync"
 )
 
-// ErrVersionConflict indicates different records with the same key and version.
 var ErrVersionConflict = errors.New("conflicting record for version")
-
-// ErrStaleRecord indicates that a newer version is already stored.
 var ErrStaleRecord = errors.New("record version is stale")
-
-// ErrVersionExhausted indicates that the logical counter cannot advance.
 var ErrVersionExhausted = errors.New("version counter exhausted")
 
 // MemoryStore holds versioned records and supports concurrent operations.
@@ -25,7 +20,6 @@ type MemoryStore struct {
 	records map[string]Record
 }
 
-// NewMemoryStore creates a store whose local updates use nodeID.
 func NewMemoryStore(nodeID string) (*MemoryStore, error) {
 	if err := validateNodeID(nodeID); err != nil {
 		return nil, fmt.Errorf("create memory store: %w", err)
@@ -33,12 +27,11 @@ func NewMemoryStore(nodeID string) (*MemoryStore, error) {
 	return &MemoryStore{nodeID: nodeID}, nil
 }
 
-// Put inserts or replaces a value with a new local version.
 func (store *MemoryStore) Put(key, value string) error {
 	return store.writeLocal(Record{Key: key, Value: value})
 }
 
-// Get returns a live value; missing keys and deletion markers return false.
+// Missing keys and deletion markers return false.
 func (store *MemoryStore) Get(key string) (string, bool) {
 	record, found := store.GetRecord(key)
 	if !found || record.Deleted {
